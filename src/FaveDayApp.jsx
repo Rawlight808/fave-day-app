@@ -925,21 +925,22 @@ function TipsSection() {
             out of harmony with the solar system and it's only temporary. You can actually come to really enjoy these days.
           </div>
           <div style={tipStyle}>
-            <strong style={{ color: "#fca5a5" }}>Give yourself permission to rest.</strong> Take the day off whenever possible.
-            You don't need to be productive. Watch movies all day, work on projects that don't really matter or have
-            any big significance. If you're someone who always wants to be super productive, it actually feels good
-            to take a couple days off a month.
+            <strong style={{ color: "#fca5a5" }}>Give yourself permission to rest.</strong> I recommend taking the day off whenever possible.
+            You may find it beneficial to release the need to be as productive as you usually are these days. Instead
+            you can spend time doing some of your favorite activities you usually don't have time for like: watching
+            movies, working on pet projects that don't really matter or have any big significance, experimenting with
+            new hobbies, taking extra long walks in nature etc. If you're someone who always wants to be super
+            productive, it can actually feel good to take a couple days off a month.
           </div>
           <div style={tipStyle}>
-            <strong style={{ color: "#fca5a5" }}>Don't force productivity.</strong> When you try to get a lot done on these days,
-            you'll sometimes realize at the end of the day you would have been better off doing nothing.
-            The effort-to-result ratio is off.
+            <strong style={{ color: "#fca5a5" }}>Don't force productivity.</strong> Sometimes when you try to get a lot done on these
+            days, you may realize at the end of the day you would have been better off doing nothing.
+            The effort-to-result ratio can be a little off.
           </div>
           <div style={tipStyle}>
             <strong style={{ color: "#fca5a5" }}>Take extra precautions.</strong> Lock your car. Drive the speed limit. Leave extra
             early and expect delays. If you have to work with computers, expect issues and errors. Double check and
-            triple check things. Take as little risk as possible. Don't push your luck. Probably not a great day
-            to ask for a raise for example.
+            triple check things. Take as little risk as possible. Don't push your luck unnecessarily.
           </div>
           <div style={tipStyle}>
             <strong style={{ color: "#fca5a5" }}>Be skeptical of new opportunities.</strong> Put less trust in any opportunity that

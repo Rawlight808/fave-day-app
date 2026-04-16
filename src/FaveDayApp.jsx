@@ -700,7 +700,7 @@ function UpcomingDays({ yearData, type, limit = 5 }) {
   const isFave = type === "fave";
   const color = isFave ? "#fef08a" : "#fca5a5";
   const label = isFave ? "Fave Days" : "Unfave Days";
-  const emoji = isFave ? "✨" : "⚠️";
+  const emoji = isFave ? "✨" : "🙃";
 
   function fmtDate(d) {
     return d.date.toLocaleDateString("en-US", { month: "short", day: "numeric" });

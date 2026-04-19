@@ -17,6 +17,23 @@ const SIGN_COLORS = [
   "#ec4899","#dc2626","#8b5cf6","#64748b","#06b6d4","#818cf8"
 ];
 
+// Palette for additional people — distinct from gold (fave tint) and red (unfave tint)
+const PERSON_COLORS = [
+  "#06b6d4", // cyan
+  "#10b981", // emerald
+  "#ec4899", // pink
+  "#f97316", // orange
+  "#14b8a6", // teal
+  "#84cc16", // lime
+  "#a855f7", // purple
+  "#3b82f6", // blue
+  "#d946ef", // fuchsia
+  "#22d3ee", // sky
+];
+
+const PEOPLE_STORAGE_KEY = "favedayapp.people";
+const MAX_PEOPLE = 11;
+
 const OPPOSITE_SIGN = {
   0:6, 1:7, 2:8, 3:9, 4:10, 5:11,
   6:0, 7:1, 8:2, 9:3, 10:4, 11:5
@@ -362,174 +379,249 @@ function generateYearData(startYear, sunSign, startMonth) {
   return results;
 }
 
-// ---- GENERATE .ICS CALENDAR FILE ----
-function generateICS(yearData, sunSign, year) {
-  const oppSign = OPPOSITE_SIGN[sunSign];
-  const faveDays = yearData.filter(d => d.type === "fave");
-  const unfaveDays = yearData.filter(d => d.type === "unfave");
+// ============================================================
+// PEOPLE HELPERS — multi-person state + persistence
+// ============================================================
 
-  function formatICSDate(date) {
-    const y = date.getFullYear();
-    const m = String(date.getMonth() + 1).padStart(2, "0");
-    const d = String(date.getDate()).padStart(2, "0");
-    return `${y}${m}${d}`;
-  }
-
-  function nextDay(date) {
-    const next = new Date(date);
-    next.setDate(next.getDate() + 1);
-    return next;
-  }
-
-  const now = new Date();
-  const stamp = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,"0")}${String(now.getDate()).padStart(2,"0")}T${String(now.getHours()).padStart(2,"0")}${String(now.getMinutes()).padStart(2,"0")}00`;
-
-  let ics = [
-    "BEGIN:VCALENDAR",
-    "VERSION:2.0",
-    "PRODID:-//Fave Day App//Sidereal Moon Tracker//EN",
-    "CALSCALE:GREGORIAN",
-    "METHOD:PUBLISH",
-    `X-WR-CALNAME:Fave Days`,
-  ];
-
-  // Group consecutive days of the same type into spans
-  function groupConsecutive(days) {
-    if (days.length === 0) return [];
-    const groups = [];
-    let start = days[0].date;
-    let prev = days[0].date;
-    for (let i = 1; i < days.length; i++) {
-      const diff = (days[i].date - prev) / (1000 * 60 * 60 * 24);
-      if (diff === 1) {
-        prev = days[i].date;
-      } else {
-        groups.push({ start, end: prev });
-        start = days[i].date;
-        prev = days[i].date;
-      }
-    }
-    groups.push({ start, end: prev });
-    return groups;
-  }
-
-  const faveGroups = groupConsecutive(faveDays);
-  const unfaveGroups = groupConsecutive(unfaveDays);
-
-  let uid = 1;
-  for (const g of faveGroups) {
-    ics.push("BEGIN:VEVENT");
-    ics.push(`DTSTART;VALUE=DATE:${formatICSDate(g.start)}`);
-    ics.push(`DTEND;VALUE=DATE:${formatICSDate(nextDay(g.end))}`);
-    ics.push(`DTSTAMP:${stamp}`);
-    ics.push(`UID:faveday-${uid++}@favedayapp`);
-    const days = Math.round((g.end - g.start) / (1000*60*60*24)) + 1;
-    ics.push(`SUMMARY:${SIGN_SYMBOLS[sunSign]} Fave Day${days > 1 ? "s" : ""} (${SIGNS[sunSign]} Moon)`);
-    ics.push(`DESCRIPTION:The Moon is in your sidereal Sun sign (${SIGNS[sunSign]}). Enjoy your Fave Day!`);
-    ics.push("END:VEVENT");
-  }
-
-  for (const g of unfaveGroups) {
-    ics.push("BEGIN:VEVENT");
-    ics.push(`DTSTART;VALUE=DATE:${formatICSDate(g.start)}`);
-    ics.push(`DTEND;VALUE=DATE:${formatICSDate(nextDay(g.end))}`);
-    ics.push(`DTSTAMP:${stamp}`);
-    ics.push(`UID:faveday-${uid++}@favedayapp`);
-    const days = Math.round((g.end - g.start) / (1000*60*60*24)) + 1;
-    ics.push(`SUMMARY:${SIGN_SYMBOLS[oppSign]} Unfave Day${days > 1 ? "s" : ""} (${SIGNS[oppSign]} Moon)`);
-    ics.push(`DESCRIPTION:The Moon is in ${SIGNS[oppSign]}, opposite your sidereal Sun sign. Lay low today.`);
-    ics.push("END:VEVENT");
-  }
-
-  ics.push("END:VCALENDAR");
-  return ics.join("\r\n");
+function makeId() {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+  return "p-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
-function downloadICS(yearData, sunSign, year, type) {
-  const oppSign = OPPOSITE_SIGN[sunSign];
-  let filtered = yearData;
-  let filename = `fave-days-${year}.ics`;
+function createPerson({ name, month, day, year, hour, colorIndex }) {
+  const h = hour === null || hour === undefined ? 12 : hour;
+  const sunSign = getSiderealSunSign(year, month, day, h);
+  return {
+    id: makeId(),
+    name: (name || "").trim() || "Me",
+    month, day, year,
+    hour: hour === null || hour === undefined ? null : hour,
+    sunSign,
+    color: PERSON_COLORS[(colorIndex % PERSON_COLORS.length + PERSON_COLORS.length) % PERSON_COLORS.length],
+    visible: true,
+  };
+}
 
-  if (type === "fave") {
-    filtered = { ...yearData };
-    // We pass full data but generate only fave events
+function loadPeople() {
+  try {
+    const raw = localStorage.getItem(PEOPLE_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(p => p && typeof p.year === "number" && typeof p.month === "number" && typeof p.day === "number")
+      .map((p, idx) => {
+        const hr = p.hour === null || p.hour === undefined ? 12 : p.hour;
+        return {
+          id: p.id || makeId(),
+          name: typeof p.name === "string" && p.name.trim() ? p.name : (idx === 0 ? "Me" : `Person ${idx + 1}`),
+          month: p.month, day: p.day, year: p.year,
+          hour: p.hour === null || p.hour === undefined ? null : p.hour,
+          // Re-derive sunSign as a safety net
+          sunSign: getSiderealSunSign(p.year, p.month, p.day, hr),
+          color: typeof p.color === "string" ? p.color : PERSON_COLORS[idx % PERSON_COLORS.length],
+          visible: p.visible !== false,
+        };
+      })
+      .slice(0, MAX_PEOPLE);
+  } catch {
+    return [];
   }
+}
 
-  const icsContent = type === "all"
-    ? generateICS(yearData, sunSign, year)
-    : generateICSFiltered(yearData, sunSign, year, type);
+function savePeople(people) {
+  try {
+    if (people.length === 0) localStorage.removeItem(PEOPLE_STORAGE_KEY);
+    else localStorage.setItem(PEOPLE_STORAGE_KEY, JSON.stringify(people));
+  } catch {
+    // ignore (private browsing, quota, etc.)
+  }
+}
 
-  const blob = new Blob([icsContent], { type: "text/calendar;charset=utf-8" });
+// Compute a unique short label per person — starts at 1 char, grows until no
+// other person shares the same prefix. So [Mom, Mike] -> {Mom: "Mo", Mike: "Mi"}.
+function computeInitials(people) {
+  const names = people.map(p => (p.name || "").trim() || "?");
+  const out = {};
+  for (let i = 0; i < people.length; i++) {
+    const name = names[i];
+    let len = 1;
+    while (len < name.length) {
+      const me = name.slice(0, len).toLowerCase();
+      const clash = names.some((n, j) => j !== i && n.slice(0, len).toLowerCase() === me);
+      if (!clash) break;
+      len++;
+    }
+    const raw = name.slice(0, len);
+    out[people[i].id] = raw.charAt(0).toUpperCase() + raw.slice(1).toLowerCase();
+  }
+  return out;
+}
+
+// ---- ICS HELPERS ----
+function formatICSDate(date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}${m}${d}`;
+}
+
+function formatICSDateTime(date, hour) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  const hh = String(hour).padStart(2, "0");
+  return `${y}${m}${d}T${hh}0000`;
+}
+
+function nextDay(date) {
+  const next = new Date(date);
+  next.setDate(next.getDate() + 1);
+  return next;
+}
+
+// Groups consecutive days of the same type, preserving the entries so
+// we can use `transitStartHour` / `transitEndHour` on the boundary days.
+function groupConsecutive(days) {
+  if (days.length === 0) return [];
+  const groups = [];
+  let startEntry = days[0];
+  let prevEntry = days[0];
+  for (let i = 1; i < days.length; i++) {
+    const diff = (days[i].date - prevEntry.date) / (1000 * 60 * 60 * 24);
+    if (diff === 1) {
+      prevEntry = days[i];
+    } else {
+      groups.push({ start: startEntry.date, end: prevEntry.date, startEntry, endEntry: prevEntry });
+      startEntry = days[i];
+      prevEntry = days[i];
+    }
+  }
+  groups.push({ start: startEntry.date, end: prevEntry.date, startEntry, endEntry: prevEntry });
+  return groups;
+}
+
+function icsStamp() {
+  const now = new Date();
+  return `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,"0")}${String(now.getDate()).padStart(2,"0")}T${String(now.getHours()).padStart(2,"0")}${String(now.getMinutes()).padStart(2,"0")}00`;
+}
+
+function personEventLines({ person, yearData, type, includeName }) {
+  const isFave = type === "fave";
+  const sign = isFave ? person.sunSign : OPPOSITE_SIGN[person.sunSign];
+  const label = isFave ? "Fave" : "Unfave";
+  const days = yearData.filter(d => d.type === type);
+  const groups = groupConsecutive(days);
+  const stamp = icsStamp();
+  const lines = [];
+  let uid = 1;
+  for (const g of groups) {
+    const count = Math.round((g.end - g.start) / (1000*60*60*24)) + 1;
+    const prefix = includeName ? `${person.name} — ` : "";
+    const startHour = g.startEntry && g.startEntry.transitStartHour;
+    const endHour = g.endEntry && g.endEntry.transitEndHour;
+    const hasStartHour = startHour !== null && startHour !== undefined;
+    const hasEndHour = endHour !== null && endHour !== undefined;
+
+    lines.push("BEGIN:VEVENT");
+    if (hasStartHour || hasEndHour) {
+      // Timed event — use the transit boundary hours we know, fall back to
+      // midnight / next-midnight for the unknown side so the event still
+      // spans the full period.
+      const tzid = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const dtStart = hasStartHour
+        ? formatICSDateTime(g.start, startHour)
+        : formatICSDateTime(g.start, 0);
+      const dtEnd = hasEndHour
+        ? formatICSDateTime(g.end, endHour)
+        : formatICSDateTime(nextDay(g.end), 0);
+      lines.push(`DTSTART;TZID=${tzid}:${dtStart}`);
+      lines.push(`DTEND;TZID=${tzid}:${dtEnd}`);
+    } else {
+      lines.push(`DTSTART;VALUE=DATE:${formatICSDate(g.start)}`);
+      lines.push(`DTEND;VALUE=DATE:${formatICSDate(nextDay(g.end))}`);
+    }
+    lines.push(`DTSTAMP:${stamp}`);
+    lines.push(`UID:faveday-${person.id}-${type}-${uid++}@favedayapp`);
+    lines.push(`SUMMARY:${prefix}${SIGN_SYMBOLS[sign]} ${label} Day${count > 1 ? "s" : ""} (${SIGNS[sign]} Moon)`);
+    const whoseSign = includeName ? `${person.name}'s` : "your";
+    const timeLine = (hasStartHour || hasEndHour)
+      ? `\\n\\nStarts ~${hasStartHour ? formatHour(startHour) : "midnight"}, ends ~${hasEndHour ? formatHour(endHour) : "midnight"}.`
+      : "";
+    lines.push(
+      `DESCRIPTION:${isFave
+        ? `The Moon is in ${SIGNS[sign]} (${whoseSign} sidereal Sun sign). Enjoy!`
+        : `The Moon is in ${SIGNS[sign]}, opposite ${whoseSign} sidereal Sun sign.`}${timeLine}`
+    );
+    lines.push("END:VEVENT");
+  }
+  return lines;
+}
+
+// Build a combined ICS across every visible person. type: 'fave' | 'unfave' | 'all'
+function buildCombinedICS({ people, peopleYearData, type }) {
+  const visiblePeople = people.filter(p => p.visible);
+  const includeName = visiblePeople.length > 1;
+  const calName = type === "unfave" ? "Unfave Days" : "Fave Days";
+  const lines = [
+    "BEGIN:VCALENDAR", "VERSION:2.0",
+    "PRODID:-//Fave Day App//Sidereal Moon Tracker//EN",
+    "CALSCALE:GREGORIAN", "METHOD:PUBLISH",
+    `X-WR-CALNAME:${calName}`,
+  ];
+  for (const p of visiblePeople) {
+    const yd = peopleYearData[p.id] || [];
+    if (type === "fave" || type === "all") {
+      lines.push(...personEventLines({ person: p, yearData: yd, type: "fave", includeName }));
+    }
+    if (type === "unfave" || type === "all") {
+      lines.push(...personEventLines({ person: p, yearData: yd, type: "unfave", includeName }));
+    }
+  }
+  lines.push("END:VCALENDAR");
+  return lines.join("\r\n");
+}
+
+function triggerDownload(content, filename) {
+  const blob = new Blob([content], { type: "text/calendar;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = type === "all" ? `fave-unfave-days.ics`
-    : type === "fave" ? `fave-days.ics`
-    : `unfave-days.ics`;
+  a.download = filename;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
 
-function generateICSFiltered(yearData, sunSign, year, type) {
-  const oppSign = OPPOSITE_SIGN[sunSign];
-  const days = yearData.filter(d => d.type === type);
+function downloadCombinedICS(people, peopleYearData, type) {
+  const content = buildCombinedICS({ people, peopleYearData, type });
+  const filename = type === "all" ? "fave-unfave-days.ics"
+    : type === "fave" ? "fave-days.ics"
+    : "unfave-days.ics";
+  triggerDownload(content, filename);
+}
 
-  function formatICSDate(date) {
-    const y = date.getFullYear();
-    const m = String(date.getMonth() + 1).padStart(2, "0");
-    const d = String(date.getDate()).padStart(2, "0");
-    return `${y}${m}${d}`;
-  }
-  function nextDay(date) {
-    const next = new Date(date);
-    next.setDate(next.getDate() + 1);
-    return next;
-  }
-
-  const now = new Date();
-  const stamp = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,"0")}${String(now.getDate()).padStart(2,"0")}T${String(now.getHours()).padStart(2,"0")}${String(now.getMinutes()).padStart(2,"0")}00`;
-
-  const isFave = type === "fave";
-  const sign = isFave ? sunSign : oppSign;
-  const label = isFave ? "Fave" : "Unfave";
-
-  // Group consecutive
-  const groups = [];
-  if (days.length > 0) {
-    let start = days[0].date;
-    let prev = days[0].date;
-    for (let i = 1; i < days.length; i++) {
-      const diff = (days[i].date - prev) / (1000 * 60 * 60 * 24);
-      if (diff === 1) { prev = days[i].date; }
-      else { groups.push({ start, end: prev }); start = days[i].date; prev = days[i].date; }
-    }
-    groups.push({ start, end: prev });
-  }
-
-  let ics = [
+function downloadPersonICS(person, yearData, type) {
+  const calName = type === "fave" ? "Fave Days"
+    : type === "unfave" ? "Unfave Days"
+    : "Fave & Unfave Days";
+  const lines = [
     "BEGIN:VCALENDAR", "VERSION:2.0",
     "PRODID:-//Fave Day App//Sidereal Moon Tracker//EN",
     "CALSCALE:GREGORIAN", "METHOD:PUBLISH",
-    `X-WR-CALNAME:${label} Days`,
+    `X-WR-CALNAME:${person.name} — ${calName}`,
   ];
-
-  let uid = 1;
-  for (const g of groups) {
-    const count = Math.round((g.end - g.start) / (1000*60*60*24)) + 1;
-    ics.push("BEGIN:VEVENT");
-    ics.push(`DTSTART;VALUE=DATE:${formatICSDate(g.start)}`);
-    ics.push(`DTEND;VALUE=DATE:${formatICSDate(nextDay(g.end))}`);
-    ics.push(`DTSTAMP:${stamp}`);
-    ics.push(`UID:faveday-${type}-${uid++}@favedayapp`);
-    ics.push(`SUMMARY:${SIGN_SYMBOLS[sign]} ${label} Day${count > 1 ? "s" : ""} (${SIGNS[sign]} Moon)`);
-    ics.push(`DESCRIPTION:${isFave ? `The Moon is in your sign (${SIGNS[sign]}). Enjoy!` : `The Moon is in ${SIGNS[sign]}, opposite your sign. Lay low.`}`);
-    ics.push("END:VEVENT");
+  if (type === "fave" || type === "all") {
+    lines.push(...personEventLines({ person, yearData, type: "fave", includeName: false }));
   }
-
-  ics.push("END:VCALENDAR");
-  return ics.join("\r\n");
+  if (type === "unfave" || type === "all") {
+    lines.push(...personEventLines({ person, yearData, type: "unfave", includeName: false }));
+  }
+  lines.push("END:VCALENDAR");
+  const safeName = person.name.replace(/[^a-z0-9]+/gi, "-").toLowerCase() || "person";
+  const suffix = type === "all" ? "fave-unfave" : `${type}`;
+  triggerDownload(lines.join("\r\n"), `${safeName}-${suffix}-days.ics`);
 }
 
 // ============================================================
@@ -585,18 +677,30 @@ function Starfield() {
   );
 }
 
-// Calendar month component
-function CalendarMonth({ year, month, yearData, sunSign }) {
+// Calendar month component — supports multiple people
+// Every visible person renders as a chip inside each cell; chip color = person,
+// solid fill = fave, outlined = unfave. No person-specific background treatment.
+function CalendarMonth({ year, month, people, peopleYearData, initials, onSelectDay }) {
   const daysInMonth = getDaysInMonth(year, month);
   const firstDay = getFirstDayOfMonth(year, month);
-  const monthData = yearData.filter(d => d.date.getFullYear() === year && d.date.getMonth() === month);
+  const visiblePeople = people.filter(p => p.visible);
+  const isSolo = visiblePeople.length === 1;
+
+  function entryFor(person, d) {
+    const yd = peopleYearData[person.id];
+    if (!yd) return null;
+    return yd.find(e =>
+      e.date.getFullYear() === year &&
+      e.date.getMonth() === month &&
+      e.date.getDate() === d
+    ) || null;
+  }
 
   const cells = [];
   for (let i = 0; i < firstDay; i++) cells.push(null);
-  for (let d = 1; d <= daysInMonth; d++) {
-    const entry = monthData.find(e => e.date.getDate() === d);
-    cells.push(entry);
-  }
+  for (let d = 1; d <= daysInMonth; d++) cells.push(d);
+
+  const MAX_CHIPS = 4;
 
   return (
     <div style={{
@@ -621,44 +725,139 @@ function CalendarMonth({ year, month, yearData, sunSign }) {
       <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 2 }}>
         {cells.map((cell, i) => {
           if (!cell) return <div key={`empty-${i}`} />;
-          const isFave = cell.type === "fave";
-          const isUnfave = cell.type === "unfave";
-          // Build tooltip with transit times
-          let tooltip = `${SIGNS[cell.moonSign]} Moon`;
-          if (isFave || isUnfave) {
-            const label = isFave ? "Fave Day" : "Unfave Day";
-            tooltip = `${label} (${SIGNS[cell.moonSign]} Moon)`;
-            if (cell.transitStartHour !== null) tooltip += `\nStarts ~${formatHour(cell.transitStartHour)}`;
-            if (cell.transitEndHour !== null) tooltip += `\nEnds ~${formatHour(cell.transitEndHour)}`;
+          const d = cell;
+
+          // Contributors: every visible person with a fave/unfave on this day
+          const contributors = [];
+          for (const p of visiblePeople) {
+            const e = entryFor(p, d);
+            if (e && (e.type === "fave" || e.type === "unfave")) {
+              contributors.push({ person: p, entry: e });
+            }
           }
-          // Show a small time tag on boundary days
-          const hasTimeTag = (isFave || isUnfave) && (cell.transitStartHour !== null || cell.transitEndHour !== null);
-          const timeTag = cell.transitStartHour !== null
-            ? formatHour(cell.transitStartHour)
-            : cell.transitEndHour !== null ? formatHour(cell.transitEndHour) : "";
+
+          const anyFave = contributors.some(c => c.entry.type === "fave");
+          const anyUnfave = contributors.some(c => c.entry.type === "unfave");
+
+          // Tooltip — always include times when we know the transit boundary
+          let tooltip = "";
+          if (contributors.length === 0) {
+            if (isSolo) {
+              const e = entryFor(visiblePeople[0], d);
+              if (e) tooltip = `${SIGNS[e.moonSign]} Moon`;
+            }
+          } else if (isSolo) {
+            const c = contributors[0];
+            const label = c.entry.type === "fave" ? "Fave Day" : "Unfave Day";
+            tooltip = `${label} (${SIGNS[c.entry.moonSign]} Moon)`;
+            if (c.entry.transitStartHour !== null) tooltip += `\nStarts ~${formatHour(c.entry.transitStartHour)}`;
+            if (c.entry.transitEndHour !== null) tooltip += `\nEnds ~${formatHour(c.entry.transitEndHour)}`;
+          } else {
+            tooltip = contributors.map(c => {
+              const label = c.entry.type === "fave" ? "Fave Day" : "Unfave Day";
+              let line = `${c.person.name} — ${label} (${SIGNS[c.entry.moonSign]} Moon)`;
+              if (c.entry.transitStartHour !== null) line += ` · starts ~${formatHour(c.entry.transitStartHour)}`;
+              if (c.entry.transitEndHour !== null) line += ` · ends ~${formatHour(c.entry.transitEndHour)}`;
+              return line;
+            }).join("\n");
+          }
+
+          // Solo-mode time tag (boundary days)
+          let hasTimeTag = false;
+          let timeTagText = "";
+          let timeTagIsStart = false;
+          if (isSolo && contributors.length === 1) {
+            const e = contributors[0].entry;
+            if (e.transitStartHour !== null) {
+              hasTimeTag = true; timeTagIsStart = true;
+              timeTagText = formatHour(e.transitStartHour);
+            } else if (e.transitEndHour !== null) {
+              hasTimeTag = true; timeTagIsStart = false;
+              timeTagText = formatHour(e.transitEndHour);
+            }
+          }
+
+          // Soft cell tint — gold if fave-only, brown if unfave-only, purple if mixed
+          let cellBackground = "transparent";
+          let cellBorder = "1px solid transparent";
+          if (anyFave && !anyUnfave) {
+            cellBackground = "radial-gradient(circle, rgba(250,204,21,0.32) 0%, rgba(250,204,21,0.08) 100%)";
+            cellBorder = "1px solid rgba(250,204,21,0.4)";
+          } else if (anyUnfave && !anyFave) {
+            cellBackground = "radial-gradient(circle, rgba(180,83,9,0.28) 0%, rgba(180,83,9,0.08) 100%)";
+            cellBorder = "1px solid rgba(180,83,9,0.35)";
+          } else if (anyFave && anyUnfave) {
+            cellBackground = "radial-gradient(circle, rgba(139,92,246,0.22) 0%, rgba(139,92,246,0.06) 100%)";
+            cellBorder = "1px solid rgba(139,92,246,0.35)";
+          }
+
+          const cellTextColor = anyFave && !anyUnfave ? "#fef08a"
+            : anyUnfave && !anyFave ? "#fdba74"
+            : anyFave && anyUnfave ? "#e9d5ff"
+            : "rgba(255,255,255,0.5)";
+
+          const shown = contributors.slice(0, MAX_CHIPS);
+          const overflow = Math.max(0, contributors.length - MAX_CHIPS);
+
+          const isClickable = contributors.length > 0 && typeof onSelectDay === "function";
           return (
-            <div key={i} title={tooltip} style={{
-              aspectRatio: "1",
-              display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-              borderRadius: 8, position: "relative",
-              fontSize: 12, fontWeight: isFave || isUnfave ? 700 : 400,
-              color: isFave ? "#fef08a" : isUnfave ? "#fca5a5" : "rgba(255,255,255,0.5)",
-              background: isFave
-                ? "radial-gradient(circle, rgba(250,204,21,0.35) 0%, rgba(250,204,21,0.08) 100%)"
-                : isUnfave
-                ? "radial-gradient(circle, rgba(239,68,68,0.3) 0%, rgba(239,68,68,0.06) 100%)"
-                : "transparent",
-              border: isFave ? "1px solid rgba(250,204,21,0.4)" : isUnfave ? "1px solid rgba(239,68,68,0.3)" : "1px solid transparent",
-              cursor: "default",
-              transition: "all 0.2s"
-            }}>
-              {cell.date.getDate()}
+            <div key={i} title={tooltip}
+              onClick={isClickable ? () => onSelectDay({ year, month, day: d, contributors }) : undefined}
+              style={{
+                aspectRatio: "1",
+                display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "flex-start",
+                padding: "3px 0",
+                borderRadius: 8, position: "relative",
+                fontSize: 12,
+                fontWeight: contributors.length > 0 ? 700 : 400,
+                color: cellTextColor,
+                background: cellBackground,
+                border: cellBorder,
+                cursor: isClickable ? "pointer" : "default",
+                transition: "all 0.2s"
+              }}>
+              <div style={{ lineHeight: 1, marginTop: 1 }}>{d}</div>
+
               {hasTimeTag && (
                 <div style={{
                   fontSize: 6, lineHeight: 1, marginTop: 1,
-                  opacity: 0.7, letterSpacing: -0.3
+                  opacity: 0.75, letterSpacing: -0.3
                 }}>
-                  {cell.transitStartHour !== null ? `▸${timeTag}` : `${timeTag}▸`}
+                  {timeTagIsStart ? `▸${timeTagText}` : `${timeTagText}▸`}
+                </div>
+              )}
+
+              {contributors.length > 0 && !isSolo && (
+                <div style={{
+                  marginTop: "auto", marginBottom: 2,
+                  display: "flex", flexWrap: "wrap", justifyContent: "center",
+                  alignItems: "center", gap: 2, maxWidth: "100%",
+                  pointerEvents: "none"
+                }}>
+                  {shown.map((c, idx) => {
+                    const isFaveChip = c.entry.type === "fave";
+                    const label = (initials && initials[c.person.id]) || (c.person.name.trim()[0] || "?").toUpperCase();
+                    return (
+                      <span key={idx} style={{
+                        display: "inline-flex", alignItems: "center", justifyContent: "center",
+                        minWidth: 12, height: 12, padding: label.length > 1 ? "0 3px" : 0,
+                        borderRadius: 7, boxSizing: "border-box",
+                        fontSize: 8, fontWeight: 800, lineHeight: 1, letterSpacing: 0,
+                        background: isFaveChip ? c.person.color : "transparent",
+                        border: `1.5px solid ${c.person.color}`,
+                        color: isFaveChip ? "#0a0015" : c.person.color,
+                        boxShadow: isFaveChip ? "0 0 0 0.5px rgba(0,0,0,0.35)" : "none"
+                      }}>
+                        {label}
+                      </span>
+                    );
+                  })}
+                  {overflow > 0 && (
+                    <span style={{
+                      fontSize: 8, lineHeight: 1, color: "rgba(255,255,255,0.7)",
+                      fontWeight: 700, marginLeft: 1
+                    }}>+{overflow}</span>
+                  )}
                 </div>
               )}
             </div>
@@ -669,36 +868,43 @@ function CalendarMonth({ year, month, yearData, sunSign }) {
   );
 }
 
-// Upcoming fave/unfave transit periods
-function UpcomingDays({ yearData, type, limit = 5 }) {
+// Upcoming fave/unfave transit periods — spans every visible person
+function UpcomingDays({ people, peopleYearData, type, limit = 5 }) {
   const today = new Date();
   today.setHours(0,0,0,0);
 
-  // Group consecutive days of the same type into transit periods
-  const allOfType = yearData.filter(d => d.type === type);
-  const periods = [];
-  let current = null;
+  const visiblePeople = people.filter(p => p.visible);
+  const showNames = visiblePeople.length > 1;
 
-  for (const d of allOfType) {
-    if (!current) {
-      current = { start: d, end: d, days: [d] };
-    } else {
-      const diff = (d.date - current.end.date) / (1000 * 60 * 60 * 24);
-      if (diff === 1) {
-        current.end = d;
-        current.days.push(d);
+  // Collect transit periods across every visible person, tagged with the person
+  const allPeriods = [];
+  for (const person of visiblePeople) {
+    const yd = peopleYearData[person.id] || [];
+    const ofType = yd.filter(d => d.type === type);
+    let current = null;
+    for (const d of ofType) {
+      if (!current) {
+        current = { person, start: d, end: d };
       } else {
-        periods.push(current);
-        current = { start: d, end: d, days: [d] };
+        const diff = (d.date - current.end.date) / (1000 * 60 * 60 * 24);
+        if (diff === 1) {
+          current.end = d;
+        } else {
+          allPeriods.push(current);
+          current = { person, start: d, end: d };
+        }
       }
     }
+    if (current) allPeriods.push(current);
   }
-  if (current) periods.push(current);
 
-  const upcoming = periods.filter(p => p.end.date >= today).slice(0, limit);
+  const upcoming = allPeriods
+    .filter(p => p.end.date >= today)
+    .sort((a, b) => a.start.date - b.start.date)
+    .slice(0, limit);
 
   const isFave = type === "fave";
-  const color = isFave ? "#fef08a" : "#fca5a5";
+  const color = isFave ? "#fef08a" : "#fdba74";
   const label = isFave ? "Fave Days" : "Unfave Days";
   const emoji = isFave ? "✨" : "🙃";
 
@@ -709,7 +915,7 @@ function UpcomingDays({ yearData, type, limit = 5 }) {
   return (
     <div style={{
       background: "rgba(15, 10, 40, 0.7)",
-      border: `1px solid ${isFave ? "rgba(250,204,21,0.3)" : "rgba(239,68,68,0.25)"}`,
+      border: `1px solid ${isFave ? "rgba(250,204,21,0.3)" : "rgba(180,83,9,0.35)"}`,
       borderRadius: 16, padding: 20,
       backdropFilter: "blur(10px)"
     }}>
@@ -728,13 +934,29 @@ function UpcomingDays({ yearData, type, limit = 5 }) {
             return (
               <div key={i} style={{
                 padding: "10px 14px", borderRadius: 12,
-                background: isFave ? "rgba(250,204,21,0.08)" : "rgba(239,68,68,0.08)"
+                background: isFave ? "rgba(250,204,21,0.08)" : "rgba(180,83,9,0.18)"
               }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <span style={{ color: "rgba(255,255,255,0.88)", fontSize: 14, fontWeight: 600 }}>
-                    {sameDay ? fmtDate(p.start) : `${fmtDate(p.start)} → ${fmtDate(p.end)}`}
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                  <span style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                    {showNames && (
+                      <>
+                        <span style={{
+                          width: 10, height: 10, borderRadius: "50%",
+                          background: p.person.color, display: "inline-block", flexShrink: 0
+                        }} />
+                        <span style={{
+                          color: "rgba(255,255,255,0.55)", fontSize: 12, fontWeight: 600,
+                          whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 90
+                        }}>
+                          {p.person.name}
+                        </span>
+                      </>
+                    )}
+                    <span style={{ color: "rgba(255,255,255,0.88)", fontSize: 14, fontWeight: 600 }}>
+                      {sameDay ? fmtDate(p.start) : `${fmtDate(p.start)} → ${fmtDate(p.end)}`}
+                    </span>
                   </span>
-                  <span style={{ color: "rgba(255,255,255,0.4)", fontSize: 12 }}>
+                  <span style={{ color: "rgba(255,255,255,0.4)", fontSize: 12, whiteSpace: "nowrap" }}>
                     {SIGN_SYMBOLS[p.start.moonSign]} {SIGNS[p.start.moonSign]}
                   </span>
                 </div>
@@ -973,6 +1195,105 @@ function TipsSection() {
 }
 
 
+// Day detail popup — shown when a fave/unfave cell is clicked
+function DayDetailModal({ selected, onClose, isSolo }) {
+  const { year, month, day, contributors } = selected;
+  const dateLabel = new Date(year, month, day).toLocaleDateString("en-US", {
+    weekday: "long", month: "long", day: "numeric", year: "numeric"
+  });
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div onClick={onClose} style={{
+      position: "fixed", inset: 0, zIndex: 50,
+      background: "rgba(4,2,15,0.72)", backdropFilter: "blur(4px)",
+      display: "flex", alignItems: "center", justifyContent: "center",
+      padding: 20
+    }}>
+      <div onClick={e => e.stopPropagation()} style={{
+        background: "linear-gradient(135deg, rgba(26,10,46,0.98), rgba(15,10,40,0.98))",
+        border: "1px solid rgba(139,92,246,0.4)",
+        borderRadius: 18, padding: "24px 26px",
+        maxWidth: 440, width: "100%",
+        boxShadow: "0 20px 60px rgba(0,0,0,0.5)",
+        color: "#fff"
+      }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 6 }}>
+          <div style={{ color: "#c4b5fd", fontSize: 13, fontWeight: 600, letterSpacing: 1, textTransform: "uppercase" }}>
+            Day Details
+          </div>
+          <button onClick={onClose} style={{
+            background: "none", border: "none", color: "rgba(196,181,253,0.7)",
+            fontSize: 22, lineHeight: 1, cursor: "pointer", padding: 0
+          }}>×</button>
+        </div>
+        <h3 style={{ margin: "0 0 18px 0", fontSize: 20, fontWeight: 800, color: "#fff" }}>
+          {dateLabel}
+        </h3>
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {contributors.map((c, i) => {
+            const isFave = c.entry.type === "fave";
+            const label = isFave ? "Fave Day" : "Unfave Day";
+            const accent = isFave ? "#fef08a" : "#fdba74";
+            const bg = isFave ? "rgba(250,204,21,0.10)" : "rgba(180,83,9,0.18)";
+            const border = isFave ? "rgba(250,204,21,0.35)" : "rgba(180,83,9,0.45)";
+            const hasStart = c.entry.transitStartHour !== null && c.entry.transitStartHour !== undefined;
+            const hasEnd = c.entry.transitEndHour !== null && c.entry.transitEndHour !== undefined;
+            return (
+              <div key={i} style={{
+                padding: "12px 14px", borderRadius: 12,
+                background: bg, border: `1px solid ${border}`
+              }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
+                  {!isSolo && (
+                    <span style={{
+                      width: 12, height: 12, borderRadius: "50%",
+                      background: c.person.color, flexShrink: 0,
+                      boxShadow: "0 0 0 1px rgba(255,255,255,0.15)"
+                    }} />
+                  )}
+                  {!isSolo && (
+                    <span style={{ color: "#fff", fontSize: 14, fontWeight: 700 }}>
+                      {c.person.name}
+                    </span>
+                  )}
+                  <span style={{ color: accent, fontSize: 14, fontWeight: 700 }}>
+                    {label}
+                  </span>
+                  <span style={{ color: "rgba(255,255,255,0.5)", fontSize: 13, marginLeft: "auto" }}>
+                    {SIGN_SYMBOLS[c.entry.moonSign]} {SIGNS[c.entry.moonSign]} Moon
+                  </span>
+                </div>
+                {(hasStart || hasEnd) ? (
+                  <div style={{ fontSize: 13, color: "rgba(255,255,255,0.75)", lineHeight: 1.5 }}>
+                    {hasStart && <div>Starts ~{formatHour(c.entry.transitStartHour)}</div>}
+                    {hasEnd && <div>Ends ~{formatHour(c.entry.transitEndHour)}</div>}
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 12, color: "rgba(255,255,255,0.45)" }}>
+                    In progress all day (no transit boundary today)
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        <div style={{
+          marginTop: 16, fontSize: 11, color: "rgba(255,255,255,0.4)",
+          textAlign: "center"
+        }}>
+          Times in {Intl.DateTimeFormat().resolvedOptions().timeZone}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ============================================================
 // MAIN APP
 // ============================================================
@@ -984,10 +1305,45 @@ export default function FaveDayApp() {
   const [birthHour, setBirthHour] = useState("");
   const [displayYear, setDisplayYear] = useState(new Date().getFullYear());
   const [displayStartMonth, setDisplayStartMonth] = useState(new Date().getMonth()); // 0-indexed
-  const [sunSign, setSunSign] = useState(null);
-  const [yearData, setYearData] = useState(null);
+
+  // Multi-person state
+  const [people, setPeople] = useState([]);
+  const [editingPersonId, setEditingPersonId] = useState(null); // null | 'new' | <id>
+  const [formName, setFormName] = useState("");
+  const [formMonth, setFormMonth] = useState("");
+  const [formDay, setFormDay] = useState("");
+  const [formYear, setFormYear] = useState("");
+  const [formHour, setFormHour] = useState("");
+  const [formError, setFormError] = useState("");
+  const [perPersonOpen, setPerPersonOpen] = useState(false);
+  const [selectedDay, setSelectedDay] = useState(null); // { year, month, day, contributors }
+
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+
+  // Hydrate from localStorage on mount; skip straight to results if we have anyone stored.
+  useEffect(() => {
+    const stored = loadPeople();
+    if (stored.length > 0) {
+      setPeople(stored);
+      setPage("results");
+    }
+  }, []);
+
+  // Persist on every change
+  useEffect(() => {
+    savePeople(people);
+  }, [people]);
+
+  // Precompute year data per person. Memoized on people + window so we don't
+  // re-run the astronomical engine more than necessary.
+  const peopleYearData = useMemo(() => {
+    const map = {};
+    for (const p of people) {
+      map[p.id] = generateYearData(displayYear, p.sunSign, displayStartMonth);
+    }
+    return map;
+  }, [people, displayYear, displayStartMonth]);
 
   const calculate = useCallback(() => {
     setError("");
@@ -1001,22 +1357,18 @@ export default function FaveDayApp() {
     }
 
     setLoading(true);
-
-    // Use setTimeout to let the UI update with loading state
     setTimeout(() => {
       try {
-        const h = birthHour !== "" ? parseInt(birthHour) : 12; // default to noon if no time given
-        const sign = getSiderealSunSign(y, m, d, h);
-        setSunSign(sign);
+        const hr = birthHour === "" ? null : parseInt(birthHour);
+        const primary = createPerson({
+          name: "Me", month: m, day: d, year: y, hour: hr, colorIndex: 0,
+        });
+        setPeople([primary]);
         const now = new Date();
-        const startMo = now.getMonth(); // 0-indexed
-        const startYr = now.getFullYear();
-        setDisplayYear(startYr);
-        setDisplayStartMonth(startMo);
-        const data = generateYearData(startYr, sign, startMo);
-        setYearData(data);
+        setDisplayYear(now.getFullYear());
+        setDisplayStartMonth(now.getMonth());
         setPage("results");
-      } catch (e) {
+      } catch {
         setError("Calculation error. Please check your date.");
       }
       setLoading(false);
@@ -1024,16 +1376,81 @@ export default function FaveDayApp() {
   }, [birthYear, birthMonth, birthDay, birthHour]);
 
   const switchRange = useCallback((direction) => {
-    if (sunSign === null) return;
-    // Shift the 12-month window by 1 year
-    const newYear = displayYear + direction;
-    setDisplayYear(newYear);
-    setLoading(true);
-    setTimeout(() => {
-      setYearData(generateYearData(newYear, sunSign, displayStartMonth));
-      setLoading(false);
-    }, 50);
-  }, [sunSign, displayYear, displayStartMonth]);
+    if (people.length === 0) return;
+    setDisplayYear(y => y + direction);
+  }, [people.length]);
+
+  // ---- Person CRUD handlers ----
+  const openAddForm = useCallback(() => {
+    if (people.length >= MAX_PEOPLE) return;
+    setEditingPersonId("new");
+    setFormName("");
+    setFormMonth(""); setFormDay(""); setFormYear(""); setFormHour("");
+    setFormError("");
+  }, [people.length]);
+
+  const openEditForm = useCallback((person) => {
+    setEditingPersonId(person.id);
+    setFormName(person.name);
+    setFormMonth(String(person.month));
+    setFormDay(String(person.day));
+    setFormYear(String(person.year));
+    setFormHour(person.hour === null ? "" : String(person.hour));
+    setFormError("");
+  }, []);
+
+  const cancelForm = useCallback(() => {
+    setEditingPersonId(null);
+    setFormError("");
+  }, []);
+
+  const submitForm = useCallback(() => {
+    setFormError("");
+    const name = formName.trim();
+    const y = parseInt(formYear);
+    const m = parseInt(formMonth);
+    const d = parseInt(formDay);
+    if (!name) { setFormError("Please enter a name."); return; }
+    if (!y || !m || !d || y < 1900 || y > 2100 || m < 1 || m > 12 || d < 1 || d > 31) {
+      setFormError("Please enter a valid date of birth.");
+      return;
+    }
+    const hr = formHour === "" ? null : parseInt(formHour);
+    if (editingPersonId === "new") {
+      if (people.length >= MAX_PEOPLE) { setFormError(`Maximum ${MAX_PEOPLE} people.`); return; }
+      const next = createPerson({
+        name, month: m, day: d, year: y, hour: hr, colorIndex: people.length,
+      });
+      setPeople([...people, next]);
+    } else {
+      setPeople(people.map(p => {
+        if (p.id !== editingPersonId) return p;
+        const h = hr === null ? 12 : hr;
+        return {
+          ...p,
+          name, month: m, day: d, year: y, hour: hr,
+          sunSign: getSiderealSunSign(y, m, d, h),
+        };
+      }));
+    }
+    setEditingPersonId(null);
+  }, [editingPersonId, formName, formMonth, formDay, formYear, formHour, people]);
+
+  const deletePerson = useCallback((id) => {
+    setPeople(prev => prev.filter(p => p.id !== id));
+    setEditingPersonId(cur => (cur === id ? null : cur));
+  }, []);
+
+  const togglePersonVisibility = useCallback((id) => {
+    setPeople(prev => prev.map(p => p.id === id ? { ...p, visible: !p.visible } : p));
+  }, []);
+
+  const clearAllAndGoHome = useCallback(() => {
+    setPeople([]);
+    setEditingPersonId(null);
+    setBirthMonth(""); setBirthDay(""); setBirthYear(""); setBirthHour("");
+    setPage("home");
+  }, []);
 
   // Shared styles
   const containerStyle = {
@@ -1231,7 +1648,7 @@ export default function FaveDayApp() {
           * { box-sizing: border-box; }
         `}</style>
         <div style={{ position: "relative", zIndex: 1, maxWidth: 860, margin: "0 auto", padding: "40px 20px" }}>
-          <button onClick={() => setPage(sunSign !== null ? "results" : "home")}
+          <button onClick={() => setPage(people.length > 0 ? "results" : "home")}
             style={{
               ...btnBase, background: "rgba(255,255,255,0.08)",
               border: "1px solid rgba(139,92,246,0.2)",
@@ -1255,7 +1672,7 @@ export default function FaveDayApp() {
           * { box-sizing: border-box; }
         `}</style>
         <div style={{ position: "relative", zIndex: 1, maxWidth: 860, margin: "0 auto", padding: "40px 20px" }}>
-          <button onClick={() => setPage(sunSign !== null ? "results" : "home")}
+          <button onClick={() => setPage(people.length > 0 ? "results" : "home")}
             style={{
               ...btnBase, background: "rgba(255,255,255,0.08)",
               border: "1px solid rgba(139,92,246,0.2)",
@@ -1270,19 +1687,87 @@ export default function FaveDayApp() {
   }
 
   // ---- RESULTS PAGE ----
-  if (page === "results" && yearData && sunSign !== null) {
-    const oppSign = OPPOSITE_SIGN[sunSign];
+  if (page === "results" && people.length > 0) {
+    const primary = people[0];
+    const primarySign = primary.sunSign;
+    const primaryOpp = OPPOSITE_SIGN[primarySign];
+    const visibleCount = people.filter(p => p.visible).length;
+    const isEditingForm = editingPersonId !== null;
+
+    const formInputStyle = {
+      width: "100%", padding: "10px 12px", borderRadius: 8,
+      background: "rgba(255,255,255,0.06)",
+      border: "1px solid rgba(139,92,246,0.2)",
+      color: "#fff", fontSize: 13, fontWeight: 600,
+      fontFamily: "inherit",
+    };
+
+    const renderPersonForm = () => {
+      const isNew = editingPersonId === "new";
+      return (
+        <div style={{
+          padding: 14, borderRadius: 10,
+          background: "rgba(139,92,246,0.08)",
+          border: "1px solid rgba(139,92,246,0.35)"
+        }}>
+          <div style={{ color: "#c4b5fd", fontSize: 13, fontWeight: 700, marginBottom: 10, letterSpacing: 0.5, textTransform: "uppercase" }}>
+            {isNew ? "Add Person" : "Edit Person"}
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1.6fr 0.7fr 0.7fr 0.9fr 1.3fr", gap: 8, marginBottom: 10 }}>
+            <input placeholder="Name" value={formName} onChange={e => setFormName(e.target.value)} style={formInputStyle} />
+            <input type="number" placeholder="MM" min="1" max="12" value={formMonth} onChange={e => setFormMonth(e.target.value)} style={formInputStyle} />
+            <input type="number" placeholder="DD" min="1" max="31" value={formDay} onChange={e => setFormDay(e.target.value)} style={formInputStyle} />
+            <input type="number" placeholder="YYYY" min="1900" max="2100" value={formYear} onChange={e => setFormYear(e.target.value)} style={formInputStyle} />
+            <select value={formHour} onChange={e => setFormHour(e.target.value)}
+              style={{
+                ...formInputStyle,
+                appearance: "none", WebkitAppearance: "none",
+                color: formHour === "" ? "rgba(255,255,255,0.5)" : "#fff",
+                backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 12 12'%3E%3Cpath fill='%23c4b5fd' d='M6 8L1 3h10z'/%3E%3C/svg%3E")`,
+                backgroundRepeat: "no-repeat",
+                backgroundPosition: "right 10px center"
+              }}>
+              <option value="" style={{ background: "#1a0a2e" }}>Hour (optional)</option>
+              {Array.from({ length: 24 }, (_, i) => {
+                const ampm = i < 12 ? "AM" : "PM";
+                const h12 = i === 0 ? 12 : i > 12 ? i - 12 : i;
+                return <option key={i} value={i} style={{ background: "#1a0a2e", color: "#fff" }}>{h12}:00 {ampm}</option>;
+              })}
+            </select>
+          </div>
+          {formError && (
+            <div style={{
+              color: "#fca5a5", fontSize: 12, marginBottom: 8,
+              padding: "6px 10px", background: "rgba(239,68,68,0.08)",
+              border: "1px solid rgba(239,68,68,0.25)", borderRadius: 6
+            }}>{formError}</div>
+          )}
+          <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+            <button onClick={cancelForm}
+              style={{ ...btnBase, padding: "8px 16px", fontSize: 12, background: "rgba(255,255,255,0.06)", border: "1px solid rgba(139,92,246,0.2)", color: "#c4b5fd" }}>
+              Cancel
+            </button>
+            <button onClick={submitForm}
+              style={{ ...btnBase, padding: "8px 16px", fontSize: 12, background: "linear-gradient(135deg, #7c3aed, #6d28d9)", color: "#fff" }}>
+              {isNew ? "Add" : "Save"}
+            </button>
+          </div>
+        </div>
+      );
+    };
+
     return (
       <div style={containerStyle}>
         <Starfield />
         <style>{`
           @keyframes twinkle { from { opacity: 0.2; } to { opacity: 1; } }
+          input:focus, select:focus { outline: none; border-color: rgba(139,92,246,0.6) !important; box-shadow: 0 0 0 3px rgba(139,92,246,0.15); }
           * { box-sizing: border-box; }
         `}</style>
         <div style={{ position: "relative", zIndex: 1, maxWidth: 960, margin: "0 auto", padding: "40px 20px 80px" }}>
           {/* Header */}
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 28, flexWrap: "wrap", gap: 12 }}>
-            <button onClick={() => { setPage("home"); setSunSign(null); setYearData(null); }}
+            <button onClick={clearAllAndGoHome}
               style={{
                 ...btnBase, background: "rgba(255,255,255,0.08)",
                 border: "1px solid rgba(139,92,246,0.2)",
@@ -1310,26 +1795,129 @@ export default function FaveDayApp() {
             </div>
           </div>
 
-          {/* Sign banner */}
+          {/* Sign banner — always shows the primary user */}
           <div style={{
-            textAlign: "center", marginBottom: 32,
+            textAlign: "center", marginBottom: 24,
             background: "rgba(15,10,40,0.7)",
             border: "1px solid rgba(139,92,246,0.25)",
             borderRadius: 24, padding: "28px 20px",
             backdropFilter: "blur(10px)"
           }}>
-            <div style={{ fontSize: 48, marginBottom: 4 }}>{SIGN_SYMBOLS[sunSign]}</div>
-            <h2 style={{ fontSize: 28, fontWeight: 900, margin: "0 0 4px 0", color: SIGN_COLORS[sunSign] }}>
-              {SIGNS[sunSign]}
+            <div style={{ fontSize: 48, marginBottom: 4 }}>{SIGN_SYMBOLS[primarySign]}</div>
+            <h2 style={{ fontSize: 28, fontWeight: 900, margin: "0 0 4px 0", color: SIGN_COLORS[primarySign] }}>
+              {SIGNS[primarySign]}
             </h2>
             <p style={{ margin: 0, color: "rgba(196,181,253,0.6)", fontSize: 14 }}>
-              Your Sidereal Sun Sign
+              {people.length > 1 ? `${primary.name}'s Sidereal Sun Sign` : "Your Sidereal Sun Sign"}
             </p>
             <div style={{
-              display: "inline-flex", gap: 20, marginTop: 16, fontSize: 13, color: "rgba(255,255,255,0.5)"
+              display: "inline-flex", flexWrap: "wrap", justifyContent: "center",
+              gap: 20, marginTop: 16, fontSize: 13, color: "rgba(255,255,255,0.5)"
             }}>
-              <span>Fave Day = <span style={{ color: "#fef08a", fontWeight: 700 }}>{SIGN_SYMBOLS[sunSign]} {SIGNS[sunSign]}</span> Moon</span>
-              <span>Unfave Day = <span style={{ color: "#fca5a5", fontWeight: 700 }}>{SIGN_SYMBOLS[oppSign]} {SIGNS[oppSign]}</span> Moon</span>
+              <span>Fave Day = <span style={{ color: "#fef08a", fontWeight: 700 }}>{SIGN_SYMBOLS[primarySign]} {SIGNS[primarySign]}</span> Moon</span>
+              <span>Unfave Day = <span style={{ color: "#fdba74", fontWeight: 700 }}>{SIGN_SYMBOLS[primaryOpp]} {SIGNS[primaryOpp]}</span> Moon</span>
+            </div>
+          </div>
+
+          {/* People card */}
+          <div style={{
+            background: "rgba(15,10,40,0.7)",
+            border: "1px solid rgba(139,92,246,0.25)",
+            borderRadius: 16, padding: "20px 24px", marginBottom: 20,
+            backdropFilter: "blur(10px)",
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, gap: 12, flexWrap: "wrap" }}>
+              <div>
+                <div style={{ color: "#c4b5fd", fontSize: 15, fontWeight: 700 }}>People</div>
+                <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 12, marginTop: 2 }}>
+                  {people.length === 1
+                    ? "Add family or friends to see everyone's Fave Days on one calendar"
+                    : `${visibleCount} of ${people.length} visible`}
+                </div>
+              </div>
+              <button onClick={openAddForm}
+                disabled={people.length >= MAX_PEOPLE || isEditingForm}
+                title={people.length >= MAX_PEOPLE ? `Max ${MAX_PEOPLE} people` : undefined}
+                style={{
+                  ...btnBase, padding: "8px 16px", fontSize: 13,
+                  background: people.length >= MAX_PEOPLE || isEditingForm ? "rgba(255,255,255,0.04)" : "rgba(139,92,246,0.2)",
+                  border: "1px solid rgba(139,92,246,0.35)",
+                  color: people.length >= MAX_PEOPLE || isEditingForm ? "rgba(196,181,253,0.4)" : "#c4b5fd",
+                  cursor: people.length >= MAX_PEOPLE || isEditingForm ? "not-allowed" : "pointer"
+                }}>
+                {people.length >= MAX_PEOPLE ? `Max ${MAX_PEOPLE} people` : "+ Add person"}
+              </button>
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {people.map((p, idx) => (
+                editingPersonId === p.id
+                  ? <div key={p.id}>{renderPersonForm()}</div>
+                  : (
+                    <div key={p.id} style={{
+                      display: "flex", alignItems: "center", gap: 12,
+                      padding: "10px 14px", borderRadius: 10,
+                      background: "rgba(255,255,255,0.03)",
+                      border: "1px solid rgba(139,92,246,0.15)",
+                      opacity: p.visible ? 1 : 0.55,
+                      flexWrap: "wrap"
+                    }}>
+                      <input
+                        type="checkbox"
+                        checked={p.visible}
+                        onChange={() => togglePersonVisibility(p.id)}
+                        style={{ width: 16, height: 16, accentColor: p.color, cursor: "pointer", flexShrink: 0 }}
+                        title={p.visible ? "Hide on calendar" : "Show on calendar"}
+                      />
+                      <span style={{
+                        width: 14, height: 14, borderRadius: "50%",
+                        background: p.color, flexShrink: 0,
+                        boxShadow: "0 0 0 1px rgba(255,255,255,0.1)"
+                      }} />
+                      <span style={{ color: "#fff", fontSize: 14, fontWeight: 600, minWidth: 60 }}>
+                        {p.name}{idx === 0 && people.length > 1 ? (
+                          <span style={{ color: "rgba(196,181,253,0.5)", fontSize: 11, fontWeight: 500, marginLeft: 6 }}>
+                            primary
+                          </span>
+                        ) : null}
+                      </span>
+                      <span style={{ color: "rgba(255,255,255,0.6)", fontSize: 13 }}>
+                        {SIGN_SYMBOLS[p.sunSign]} {SIGNS[p.sunSign]}
+                      </span>
+                      <span style={{ color: "rgba(255,255,255,0.3)", fontSize: 12, marginLeft: "auto" }}>
+                        {String(p.month).padStart(2, "0")}/{String(p.day).padStart(2, "0")}/{p.year}
+                        {p.hour !== null && <span> · {formatHour(p.hour)}</span>}
+                      </span>
+                      <button onClick={() => openEditForm(p)}
+                        disabled={isEditingForm}
+                        style={{
+                          ...btnBase, padding: "6px 12px", fontSize: 12,
+                          background: "rgba(255,255,255,0.06)",
+                          border: "1px solid rgba(139,92,246,0.2)",
+                          color: "#c4b5fd",
+                          opacity: isEditingForm ? 0.4 : 1,
+                          cursor: isEditingForm ? "not-allowed" : "pointer"
+                        }}>
+                        Edit
+                      </button>
+                      {idx !== 0 && (
+                        <button onClick={() => deletePerson(p.id)}
+                          disabled={isEditingForm}
+                          style={{
+                            ...btnBase, padding: "6px 12px", fontSize: 12,
+                            background: "rgba(239,68,68,0.1)",
+                            border: "1px solid rgba(239,68,68,0.3)",
+                            color: "#fca5a5",
+                            opacity: isEditingForm ? 0.4 : 1,
+                            cursor: isEditingForm ? "not-allowed" : "pointer"
+                          }}>
+                          Delete
+                        </button>
+                      )}
+                    </div>
+                  )
+              ))}
+              {editingPersonId === "new" && renderPersonForm()}
             </div>
           </div>
 
@@ -1356,50 +1944,81 @@ export default function FaveDayApp() {
             background: "rgba(15,10,40,0.7)",
             border: "1px solid rgba(139,92,246,0.25)",
             borderRadius: 16, padding: "20px 24px", marginBottom: 28,
-            backdropFilter: "blur(10px)",
-            display: "flex", flexWrap: "wrap", alignItems: "center",
-            justifyContent: "space-between", gap: 12
+            backdropFilter: "blur(10px)"
           }}>
-            <div>
-              <div style={{ color: "#c4b5fd", fontSize: 15, fontWeight: 700 }}>Add to Calendar</div>
-              <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 12, marginTop: 2 }}>
-                Download .ics file, works with Apple Calendar, Google, and Outlook
+            <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+              <div>
+                <div style={{ color: "#c4b5fd", fontSize: 15, fontWeight: 700 }}>Add to Calendar</div>
+                <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 12, marginTop: 2 }}>
+                  {people.length > 1
+                    ? `Fave + Unfave days for ${visibleCount} visible ${visibleCount === 1 ? "person" : "people"}`
+                    : "Fave + Unfave days — works with Apple Calendar, Google, and Outlook"}
+                </div>
               </div>
-            </div>
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-              <button onClick={() => downloadICS(yearData, sunSign, displayYear, "fave")}
+              <button onClick={() => downloadCombinedICS(people, peopleYearData, "all")}
+                disabled={visibleCount === 0}
                 style={{
-                  ...btnBase, padding: "10px 18px", fontSize: 13,
-                  background: "rgba(250,204,21,0.15)",
-                  border: "1px solid rgba(250,204,21,0.35)",
-                  color: "#fef08a"
-                }}>
-                Fave Days
-              </button>
-              <button onClick={() => downloadICS(yearData, sunSign, displayYear, "unfave")}
-                style={{
-                  ...btnBase, padding: "10px 18px", fontSize: 13,
-                  background: "rgba(239,68,68,0.12)",
-                  border: "1px solid rgba(239,68,68,0.3)",
-                  color: "#fca5a5"
-                }}>
-                Unfave Days
-              </button>
-              <button onClick={() => downloadICS(yearData, sunSign, displayYear, "all")}
-                style={{
-                  ...btnBase, padding: "10px 18px", fontSize: 13,
+                  ...btnBase, padding: "10px 20px", fontSize: 13,
                   background: "linear-gradient(135deg, #7c3aed, #6d28d9)",
-                  color: "#fff"
+                  color: "#fff",
+                  opacity: visibleCount === 0 ? 0.4 : 1,
+                  cursor: visibleCount === 0 ? "not-allowed" : "pointer"
                 }}>
-                Both
+                Download .ics
               </button>
             </div>
+
+            {people.length > 1 && (
+              <div style={{ marginTop: 14, borderTop: "1px solid rgba(139,92,246,0.2)", paddingTop: 12 }}>
+                <button onClick={() => setPerPersonOpen(o => !o)}
+                  style={{
+                    background: "none", border: "none", padding: 0,
+                    color: "rgba(196,181,253,0.7)", fontSize: 12, fontWeight: 600,
+                    cursor: "pointer", display: "flex", alignItems: "center", gap: 4
+                  }}>
+                  <span style={{ fontSize: 10 }}>{perPersonOpen ? "▾" : "▸"}</span>
+                  Per-person downloads
+                </button>
+                {perPersonOpen && (
+                  <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+                    {people.map(p => (
+                      <div key={p.id} style={{
+                        display: "flex", alignItems: "center", gap: 10,
+                        padding: "8px 10px", borderRadius: 8,
+                        background: "rgba(255,255,255,0.02)"
+                      }}>
+                        <span style={{
+                          width: 10, height: 10, borderRadius: "50%",
+                          background: p.color, flexShrink: 0,
+                          boxShadow: "0 0 0 1px rgba(255,255,255,0.1)"
+                        }} />
+                        <span style={{ color: "#fff", fontSize: 13, fontWeight: 600, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {p.name}
+                        </span>
+                        <span style={{ color: "rgba(255,255,255,0.4)", fontSize: 11, whiteSpace: "nowrap" }}>
+                          {SIGN_SYMBOLS[p.sunSign]} {SIGNS[p.sunSign]}
+                        </span>
+                        <button onClick={() => downloadPersonICS(p, peopleYearData[p.id] || [], "all")}
+                          style={{
+                            ...btnBase, padding: "6px 14px", fontSize: 12,
+                            background: "rgba(139,92,246,0.18)",
+                            border: "1px solid rgba(139,92,246,0.4)",
+                            color: "#c4b5fd"
+                          }}>
+                          Download .ics
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Upcoming */}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 32 }}>
-            <UpcomingDays yearData={yearData} type="fave" limit={6} />
-            <UpcomingDays yearData={yearData} type="unfave" limit={6} />
+            <UpcomingDays people={people} peopleYearData={peopleYearData} type="fave" limit={6} />
+            <UpcomingDays people={people} peopleYearData={peopleYearData} type="unfave" limit={6} />
           </div>
 
           {/* Calendar grid */}
@@ -1415,24 +2034,43 @@ export default function FaveDayApp() {
               const absMonth = displayStartMonth + i;
               const yr = displayYear + Math.floor(absMonth / 12);
               const mo = absMonth % 12;
-              return <CalendarMonth key={`${yr}-${mo}`} year={yr} month={mo} yearData={yearData} sunSign={sunSign} />;
+              return (
+                <CalendarMonth
+                  key={`${yr}-${mo}`}
+                  year={yr} month={mo}
+                  people={people}
+                  peopleYearData={peopleYearData}
+                  onSelectDay={setSelectedDay}
+                />
+              );
             })}
           </div>
 
           {/* Legend */}
-          {/* Legend */}
           <div style={{
-            display: "flex", justifyContent: "center", gap: 24,
+            display: "flex", justifyContent: "center", gap: 24, flexWrap: "wrap",
             marginTop: 28, fontSize: 13, color: "rgba(255,255,255,0.5)"
           }}>
             <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
               <span style={{ width: 14, height: 14, borderRadius: 4, background: "rgba(250,204,21,0.35)", border: "1px solid rgba(250,204,21,0.4)", display: "inline-block" }} />
-              Fave Day
+              {people.length > 1 ? `${primary.name}'s Fave Day` : "Fave Day"}
             </span>
             <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
               <span style={{ width: 14, height: 14, borderRadius: 4, background: "rgba(239,68,68,0.3)", border: "1px solid rgba(239,68,68,0.3)", display: "inline-block" }} />
-              Unfave Day
+              {people.length > 1 ? `${primary.name}'s Unfave Day` : "Unfave Day"}
             </span>
+            {people.length > 1 && (
+              <>
+                <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#c4b5fd", display: "inline-block" }} />
+                  Other person's Fave
+                </span>
+                <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ width: 8, height: 8, borderRadius: "50%", background: "transparent", border: "1px solid #c4b5fd", display: "inline-block" }} />
+                  Other person's Unfave
+                </span>
+              </>
+            )}
           </div>
           {/* Timezone note */}
           <div style={{
@@ -1445,6 +2083,14 @@ export default function FaveDayApp() {
             })()})
           </div>
         </div>
+
+        {selectedDay && (
+          <DayDetailModal
+            selected={selectedDay}
+            onClose={() => setSelectedDay(null)}
+            isSolo={people.filter(p => p.visible).length <= 1}
+          />
+        )}
       </div>
     );
   }

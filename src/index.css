@@ -8,3 +8,26 @@ html, body, #root {
   width: 100%;
   height: 100%;
 }
+
+/* Match the app theme so there's never a white flash behind the WebView */
+html, body {
+  background-color: #0a0015;
+}
+
+/* Native-app feel inside the Capacitor shell: no rubber-band text selection
+   or long-press callouts, but keep inputs editable */
+body {
+  -webkit-tap-highlight-color: transparent;
+}
+
+body.native {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+body.native input,
+body.native select,
+body.native textarea {
+  -webkit-user-select: text;
+  user-select: text;
+}

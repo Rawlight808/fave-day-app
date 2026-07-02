@@ -1,0 +1,9 @@
+{
+  "appId": "com.rawlight.faveday",
+  "appName": "Fave Day",
+  "webDir": "dist",
+  "backgroundColor": "#0a0015",
+  "ios": {
+    "contentInset": "never"
+  }
+}

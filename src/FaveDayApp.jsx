@@ -1,4 +1,7 @@
 import { useState, useMemo, useCallback, useEffect } from "react";
+import { Capacitor } from "@capacitor/core";
+import { Filesystem, Directory, Encoding } from "@capacitor/filesystem";
+import { Share } from "@capacitor/share";
 
 // ============================================================
 // ASTRONOMICAL CALCULATION ENGINE — Sidereal positions
@@ -257,6 +260,15 @@ function getMoonSignForDateTime(year, month, day, hour = 12) {
 }
 
 // ---- FIND MOON TRANSIT PERIODS FOR THE YEAR ----
+// The scan is the most expensive computation in the app and depends only on
+// the year (not the person), so cache it — with several people on the
+// calendar this avoids recomputing identical data per person.
+const transitCache = new Map();
+function findMoonTransitsCached(year) {
+  if (!transitCache.has(year)) transitCache.set(year, findMoonTransits(year));
+  return transitCache.get(year);
+}
+
 // Returns an array of transit objects: { sign, startDate, startHour, endDate, endHour }
 function findMoonTransits(year) {
   const transits = [];
@@ -385,7 +397,7 @@ function generateYearData(startYear, sunSign, startMonth, natalMoonSign) {
   }
   let transits = [];
   for (const yr of yearsNeeded) {
-    transits = transits.concat(findMoonTransits(yr));
+    transits = transits.concat(findMoonTransitsCached(yr));
   }
   // Deduplicate transits by startJD
   const seen = new Set();
@@ -684,7 +696,24 @@ function buildCombinedICS({ people, peopleYearData, type }) {
   return lines.join("\r\n");
 }
 
-function triggerDownload(content, filename) {
+async function triggerDownload(content, filename) {
+  // Inside the native app shell, <a download> doesn't work — write the file
+  // and open the iOS/Android share sheet instead (user picks Calendar, Files,
+  // AirDrop, etc.)
+  if (Capacitor.isNativePlatform()) {
+    try {
+      const result = await Filesystem.writeFile({
+        path: filename,
+        data: content,
+        directory: Directory.Cache,
+        encoding: Encoding.UTF8,
+      });
+      await Share.share({ title: filename, url: result.uri });
+    } catch {
+      // user cancelled the share sheet — nothing to do
+    }
+    return;
+  }
   const blob = new Blob([content], { type: "text/calendar;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -803,6 +832,10 @@ function CalendarMonth({ year, month, people, peopleYearData, initials, onSelect
   for (let d = 1; d <= daysInMonth; d++) cells.push(d);
 
   const MAX_CHIPS = 4;
+
+  const now = new Date();
+  const todayDate = now.getFullYear() === year && now.getMonth() === month
+    ? now.getDate() : null;
 
   return (
     <div style={{
@@ -932,6 +965,7 @@ function CalendarMonth({ year, month, people, peopleYearData, initials, onSelect
                 color: cellTextColor,
                 background: cellBackground,
                 border: cellBorder,
+                boxShadow: d === todayDate ? "0 0 0 2px rgba(196,181,253,0.85)" : "none",
                 cursor: isClickable ? "pointer" : "default",
                 transition: "all 0.2s"
               }}>
@@ -989,6 +1023,14 @@ function CalendarMonth({ year, month, people, peopleYearData, initials, onSelect
   );
 }
 
+// Card styling per day type for the Upcoming lists
+const UPCOMING_STYLES = {
+  "fave": { color: "#fef08a", label: "Fave Days", emoji: "✨", border: "rgba(250,204,21,0.3)", rowBg: "rgba(250,204,21,0.08)" },
+  "unfave": { color: "#fdba74", label: "Unfave Days", emoji: "🙃", border: "rgba(180,83,9,0.35)", rowBg: "rgba(180,83,9,0.18)" },
+  "small-fave": { color: "#a5f3fc", label: "Small Fave Days", emoji: "🌙", border: "rgba(103,232,249,0.3)", rowBg: "rgba(103,232,249,0.07)" },
+  "small-unfave": { color: "#cbd5e1", label: "Small Unfave Days", emoji: "🌫️", border: "rgba(148,163,184,0.3)", rowBg: "rgba(148,163,184,0.10)" },
+};
+
 // Upcoming fave/unfave transit periods — spans every visible person
 function UpcomingDays({ people, peopleYearData, type, limit = 5 }) {
   const today = new Date();
@@ -1024,10 +1066,7 @@ function UpcomingDays({ people, peopleYearData, type, limit = 5 }) {
     .sort((a, b) => a.start.date - b.start.date)
     .slice(0, limit);
 
-  const isFave = type === "fave";
-  const color = isFave ? "#fef08a" : "#fdba74";
-  const label = isFave ? "Fave Days" : "Unfave Days";
-  const emoji = isFave ? "✨" : "🙃";
+  const { color, label, emoji, border, rowBg } = UPCOMING_STYLES[type] || UPCOMING_STYLES.fave;
 
   function fmtDate(d) {
     return d.date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
@@ -1036,7 +1075,7 @@ function UpcomingDays({ people, peopleYearData, type, limit = 5 }) {
   return (
     <div style={{
       background: "rgba(15, 10, 40, 0.7)",
-      border: `1px solid ${isFave ? "rgba(250,204,21,0.3)" : "rgba(180,83,9,0.35)"}`,
+      border: `1px solid ${border}`,
       borderRadius: 16, padding: 20,
       backdropFilter: "blur(10px)"
     }}>
@@ -1055,7 +1094,7 @@ function UpcomingDays({ people, peopleYearData, type, limit = 5 }) {
             return (
               <div key={i} style={{
                 padding: "10px 14px", borderRadius: 12,
-                background: isFave ? "rgba(250,204,21,0.08)" : "rgba(180,83,9,0.18)"
+                background: rowBg
               }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
                   <span style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
@@ -1604,7 +1643,12 @@ export default function FaveDayApp() {
     minHeight: "100vh",
     background: "linear-gradient(135deg, #0a0015 0%, #0d0b2e 30%, #1a0a2e 60%, #0a0015 100%)",
     fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-    color: "#fff", position: "relative", overflow: "hidden"
+    color: "#fff", position: "relative", overflow: "hidden",
+    // Keep content clear of the notch / home indicator on phones
+    paddingTop: "env(safe-area-inset-top)",
+    paddingBottom: "env(safe-area-inset-bottom)",
+    paddingLeft: "env(safe-area-inset-left)",
+    paddingRight: "env(safe-area-inset-right)",
   };
 
   const btnBase = {
@@ -2343,10 +2387,16 @@ export default function FaveDayApp() {
           </div>
 
           {/* Upcoming */}
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 32 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: proEnabled ? 16 : 32 }}>
             <UpcomingDays people={people} peopleYearData={peopleYearData} type="fave" limit={6} />
             <UpcomingDays people={people} peopleYearData={peopleYearData} type="unfave" limit={6} />
           </div>
+          {proEnabled && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 32 }}>
+              <UpcomingDays people={people} peopleYearData={peopleYearData} type="small-fave" limit={4} />
+              <UpcomingDays people={people} peopleYearData={peopleYearData} type="small-unfave" limit={4} />
+            </div>
+          )}
 
           {/* Calendar grid */}
           <h3 style={{ color: "#c4b5fd", fontSize: 18, fontWeight: 700, marginBottom: 16, textAlign: "center" }}>

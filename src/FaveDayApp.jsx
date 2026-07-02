@@ -32,7 +32,16 @@ const PERSON_COLORS = [
 ];
 
 const PEOPLE_STORAGE_KEY = "favedayapp.people";
+const PRO_STORAGE_KEY = "favedayapp.pro";
 const MAX_PEOPLE = 11;
+
+// Day-type display labels (small = based on natal Moon sign, a Pro feature)
+const TYPE_LABELS = {
+  "fave": "Fave Day",
+  "unfave": "Unfave Day",
+  "small-fave": "Small Fave Day",
+  "small-unfave": "Small Unfave Day",
+};
 
 const OPPOSITE_SIGN = {
   0:6, 1:7, 2:8, 3:9, 4:10, 5:11,
@@ -172,14 +181,68 @@ function getSiderealLongitude(tropicalLongitude, jd) {
   return norm360(tropicalLongitude - ayan);
 }
 
-// ---- SIDEREAL SUN SIGN FROM BIRTH DATE + TIME ----
-function getSiderealSunSign(year, month, day, hour = 12) {
-  // hour is 0-23, convert to fractional day (0 = midnight, 12 = noon)
-  const fracDay = day + hour / 24.0;
-  const jd = dateToJD(year, month, fracDay);
-  const T = julianCenturies(jd);
-  const tropSun = sunLongitude(T);
-  return getSiderealSign(tropSun, jd);
+// ---- TIME ZONE HELPERS ----
+// The browser ships the full IANA time zone database (via Intl), including
+// historical offsets and DST rules for any date. So users just pick their
+// birth city/region and we derive the exact UTC offset for their birth date.
+
+const BROWSER_TZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+function listTimeZones() {
+  try {
+    if (typeof Intl.supportedValuesOf === "function") {
+      return Intl.supportedValuesOf("timeZone");
+    }
+  } catch { /* older browsers */ }
+  return [BROWSER_TZ];
+}
+
+const TIME_ZONES = listTimeZones();
+
+// UTC offset (in hours) of `timeZone` at a given UTC instant
+function zoneOffsetHours(timeZone, utcMillis) {
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone, hour12: false,
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit",
+  });
+  const parts = {};
+  for (const p of dtf.formatToParts(new Date(utcMillis))) parts[p.type] = p.value;
+  const wallAsUTC = Date.UTC(
+    Number(parts.year), Number(parts.month) - 1, Number(parts.day),
+    parts.hour === "24" ? 0 : Number(parts.hour), Number(parts.minute)
+  );
+  return (wallAsUTC - utcMillis) / 3600000;
+}
+
+// Convert a local birth date/time in `timeZone` to a UTC Julian Day.
+// Two-pass fixed point handles DST transitions around the birth moment.
+function utcJDFromLocal(year, month, day, hour, timeZone) {
+  const tz = timeZone || BROWSER_TZ;
+  const wall = Date.UTC(year, month - 1, day, hour);
+  let utc = wall;
+  for (let i = 0; i < 2; i++) {
+    utc = wall - zoneOffsetHours(tz, utc) * 3600000;
+  }
+  return utc / 86400000 + 2440587.5;
+}
+
+// ---- NATAL SIGNS FROM BIRTH DATE + TIME + TIME ZONE ----
+function getNatalSunSign(year, month, day, hour = 12, timeZone = null) {
+  const jd = utcJDFromLocal(year, month, day, hour, timeZone);
+  return getSiderealSign(sunLongitude(julianCenturies(jd)), jd);
+}
+
+function getNatalMoonSign(year, month, day, hour = 12, timeZone = null) {
+  const jd = utcJDFromLocal(year, month, day, hour, timeZone);
+  return getSiderealSign(moonLongitude(julianCenturies(jd)), jd);
+}
+
+// Did the Moon change sidereal signs at some point during this local day?
+// If so and the birth time is unknown, the natal Moon sign is a guess.
+function isMoonBoundaryBirthday(year, month, day, timeZone = null) {
+  return getNatalMoonSign(year, month, day, 0, timeZone) !==
+         getNatalMoonSign(year, month, day, 24, timeZone);
 }
 
 // ---- MOON SIGN FOR A GIVEN DATE + HOUR (local time) ----
@@ -303,10 +366,15 @@ function formatHour(h) {
 }
 
 // ---- GENERATE RANGE DATA (12 months starting from startYear/startMonth) ----
-function generateYearData(startYear, sunSign, startMonth) {
+// natalMoonSign (optional, Pro): adds "small-fave" / "small-unfave" days when
+// the transiting Moon is in the person's natal Moon sign or its opposite.
+// Sun-sign days always win when they overlap.
+function generateYearData(startYear, sunSign, startMonth, natalMoonSign) {
   // If startMonth not provided, default to full calendar year (backward compat)
   if (startMonth === undefined) startMonth = 0; // 0-indexed
   const oppositeSign = OPPOSITE_SIGN[sunSign];
+  const hasSmall = natalMoonSign !== null && natalMoonSign !== undefined;
+  const smallOppositeSign = hasSmall ? OPPOSITE_SIGN[natalMoonSign] : null;
 
   // Collect all transits covering the 12-month range (may span 2 calendar years)
   const endMonth = startMonth + 12;
@@ -339,6 +407,8 @@ function generateYearData(startYear, sunSign, startMonth) {
       let type = "neutral";
       if (moonSign === sunSign) type = "fave";
       else if (moonSign === oppositeSign) type = "unfave";
+      else if (hasSmall && moonSign === natalMoonSign) type = "small-fave";
+      else if (hasSmall && moonSign === smallOppositeSign) type = "small-unfave";
 
       // Find which transit this day belongs to
       const dayJD = dateToJD(yr, m + 1, d + 0.5);
@@ -350,7 +420,7 @@ function generateYearData(startYear, sunSign, startMonth) {
       let transitStartDate = null;
       let transitEndDate = null;
 
-      if (transit && (type === "fave" || type === "unfave")) {
+      if (transit && type !== "neutral") {
         transitStartDate = `${transit.startYear}-${String(transit.startMonth).padStart(2,"0")}-${String(transit.startDay).padStart(2,"0")}`;
         transitEndDate = `${transit.endYear}-${String(transit.endMonth).padStart(2,"0")}-${String(transit.endDay).padStart(2,"0")}`;
 
@@ -388,15 +458,19 @@ function makeId() {
   return "p-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
-function createPerson({ name, month, day, year, hour, colorIndex }) {
+function createPerson({ name, month, day, year, hour, tz, colorIndex }) {
   const h = hour === null || hour === undefined ? 12 : hour;
-  const sunSign = getSiderealSunSign(year, month, day, h);
+  const zone = tz || BROWSER_TZ;
+  const sunSign = getNatalSunSign(year, month, day, h, zone);
+  const natalMoonSign = getNatalMoonSign(year, month, day, h, zone);
   return {
     id: makeId(),
     name: (name || "").trim() || "Me",
     month, day, year,
     hour: hour === null || hour === undefined ? null : hour,
+    tz: zone,
     sunSign,
+    natalMoonSign,
     color: PERSON_COLORS[(colorIndex % PERSON_COLORS.length + PERSON_COLORS.length) % PERSON_COLORS.length],
     visible: true,
   };
@@ -412,13 +486,17 @@ function loadPeople() {
       .filter(p => p && typeof p.year === "number" && typeof p.month === "number" && typeof p.day === "number")
       .map((p, idx) => {
         const hr = p.hour === null || p.hour === undefined ? 12 : p.hour;
+        const zone = typeof p.tz === "string" && p.tz ? p.tz : BROWSER_TZ;
         return {
           id: p.id || makeId(),
           name: typeof p.name === "string" && p.name.trim() ? p.name : (idx === 0 ? "Me" : `Person ${idx + 1}`),
           month: p.month, day: p.day, year: p.year,
           hour: p.hour === null || p.hour === undefined ? null : p.hour,
-          // Re-derive sunSign as a safety net
-          sunSign: getSiderealSunSign(p.year, p.month, p.day, hr),
+          tz: zone,
+          // Re-derive signs as a safety net (also backfills natalMoonSign / tz
+          // for people saved before these features existed)
+          sunSign: getNatalSunSign(p.year, p.month, p.day, hr, zone),
+          natalMoonSign: getNatalMoonSign(p.year, p.month, p.day, hr, zone),
           color: typeof p.color === "string" ? p.color : PERSON_COLORS[idx % PERSON_COLORS.length],
           visible: p.visible !== false,
         };
@@ -507,9 +585,15 @@ function icsStamp() {
 }
 
 function personEventLines({ person, yearData, type, includeName }) {
-  const isFave = type === "fave";
-  const sign = isFave ? person.sunSign : OPPOSITE_SIGN[person.sunSign];
-  const label = isFave ? "Fave" : "Unfave";
+  const isSmall = type === "small-fave" || type === "small-unfave";
+  const isFave = type === "fave" || type === "small-fave";
+  const baseSign = isSmall ? person.natalMoonSign : person.sunSign;
+  if (baseSign === null || baseSign === undefined) return [];
+  const sign = isFave ? baseSign : OPPOSITE_SIGN[baseSign];
+  const label = type === "fave" ? "Fave"
+    : type === "unfave" ? "Unfave"
+    : type === "small-fave" ? "Small Fave"
+    : "Small Unfave";
   const days = yearData.filter(d => d.type === type);
   const groups = groupConsecutive(days);
   const stamp = icsStamp();
@@ -545,37 +629,55 @@ function personEventLines({ person, yearData, type, includeName }) {
     lines.push(`UID:faveday-${person.id}-${type}-${uid++}@favedayapp`);
     lines.push(`SUMMARY:${prefix}${SIGN_SYMBOLS[sign]} ${label} Day${count > 1 ? "s" : ""} (${SIGNS[sign]} Moon)`);
     const whoseSign = includeName ? `${person.name}'s` : "your";
+    const signKind = isSmall ? "sidereal Moon sign" : "sidereal Sun sign";
     const timeLine = (hasStartHour || hasEndHour)
       ? `\\n\\nStarts ~${hasStartHour ? formatHour(startHour) : "midnight"}, ends ~${hasEndHour ? formatHour(endHour) : "midnight"}.`
       : "";
     lines.push(
       `DESCRIPTION:${isFave
-        ? `The Moon is in ${SIGNS[sign]} (${whoseSign} sidereal Sun sign). Enjoy!`
-        : `The Moon is in ${SIGNS[sign]}, opposite ${whoseSign} sidereal Sun sign.`}${timeLine}`
+        ? `The Moon is in ${SIGNS[sign]} (${whoseSign} ${signKind}).${isSmall ? "" : " Enjoy!"}`
+        : `The Moon is in ${SIGNS[sign]}, opposite ${whoseSign} ${signKind}.`}${timeLine}`
     );
     lines.push("END:VEVENT");
   }
   return lines;
 }
 
-// Build a combined ICS across every visible person. type: 'fave' | 'unfave' | 'all'
+// Which day types belong in each export selection. "big" = Sun-sign days,
+// "small" = Moon-sign days (Pro). Small entries only exist in yearData when
+// Pro is enabled, so "all" is safe for free users too.
+const EXPORT_TYPE_MAP = {
+  fave: ["fave"],
+  unfave: ["unfave"],
+  big: ["fave", "unfave"],
+  small: ["small-fave", "small-unfave"],
+  all: ["fave", "unfave", "small-fave", "small-unfave"],
+};
+
+const EXPORT_CAL_NAMES = {
+  fave: "Fave Days",
+  unfave: "Unfave Days",
+  big: "Fave & Unfave Days",
+  small: "Small Fave & Unfave Days",
+  all: "Fave & Unfave Days",
+};
+
+// Build a combined ICS across every visible person.
+// type: 'fave' | 'unfave' | 'big' | 'small' | 'all'
 function buildCombinedICS({ people, peopleYearData, type }) {
   const visiblePeople = people.filter(p => p.visible);
   const includeName = visiblePeople.length > 1;
-  const calName = type === "unfave" ? "Unfave Days" : "Fave Days";
   const lines = [
     "BEGIN:VCALENDAR", "VERSION:2.0",
     "PRODID:-//Fave Day App//Sidereal Moon Tracker//EN",
     "CALSCALE:GREGORIAN", "METHOD:PUBLISH",
-    `X-WR-CALNAME:${calName}`,
+    `X-WR-CALNAME:${EXPORT_CAL_NAMES[type] || "Fave Days"}`,
   ];
+  const dayTypes = EXPORT_TYPE_MAP[type] || EXPORT_TYPE_MAP.all;
   for (const p of visiblePeople) {
     const yd = peopleYearData[p.id] || [];
-    if (type === "fave" || type === "all") {
-      lines.push(...personEventLines({ person: p, yearData: yd, type: "fave", includeName }));
-    }
-    if (type === "unfave" || type === "all") {
-      lines.push(...personEventLines({ person: p, yearData: yd, type: "unfave", includeName }));
+    for (const dt of dayTypes) {
+      lines.push(...personEventLines({ person: p, yearData: yd, type: dt, includeName }));
     }
   }
   lines.push("END:VCALENDAR");
@@ -597,30 +699,30 @@ function triggerDownload(content, filename) {
 function downloadCombinedICS(people, peopleYearData, type) {
   const content = buildCombinedICS({ people, peopleYearData, type });
   const filename = type === "all" ? "fave-unfave-days.ics"
+    : type === "big" ? "fave-unfave-days.ics"
+    : type === "small" ? "small-fave-unfave-days.ics"
     : type === "fave" ? "fave-days.ics"
     : "unfave-days.ics";
   triggerDownload(content, filename);
 }
 
 function downloadPersonICS(person, yearData, type) {
-  const calName = type === "fave" ? "Fave Days"
-    : type === "unfave" ? "Unfave Days"
-    : "Fave & Unfave Days";
   const lines = [
     "BEGIN:VCALENDAR", "VERSION:2.0",
     "PRODID:-//Fave Day App//Sidereal Moon Tracker//EN",
     "CALSCALE:GREGORIAN", "METHOD:PUBLISH",
-    `X-WR-CALNAME:${person.name} — ${calName}`,
+    `X-WR-CALNAME:${person.name} — ${EXPORT_CAL_NAMES[type] || "Fave & Unfave Days"}`,
   ];
-  if (type === "fave" || type === "all") {
-    lines.push(...personEventLines({ person, yearData, type: "fave", includeName: false }));
-  }
-  if (type === "unfave" || type === "all") {
-    lines.push(...personEventLines({ person, yearData, type: "unfave", includeName: false }));
+  const dayTypes = EXPORT_TYPE_MAP[type] || EXPORT_TYPE_MAP.all;
+  for (const dt of dayTypes) {
+    lines.push(...personEventLines({ person, yearData, type: dt, includeName: false }));
   }
   lines.push("END:VCALENDAR");
   const safeName = person.name.replace(/[^a-z0-9]+/gi, "-").toLowerCase() || "person";
-  const suffix = type === "all" ? "fave-unfave" : `${type}`;
+  const suffix = type === "all" ? "fave-unfave"
+    : type === "big" ? "fave-unfave"
+    : type === "small" ? "small"
+    : `${type}`;
   triggerDownload(lines.join("\r\n"), `${safeName}-${suffix}-days.ics`);
 }
 
@@ -727,17 +829,20 @@ function CalendarMonth({ year, month, people, peopleYearData, initials, onSelect
           if (!cell) return <div key={`empty-${i}`} />;
           const d = cell;
 
-          // Contributors: every visible person with a fave/unfave on this day
+          // Contributors: every visible person with a fave/unfave (or small
+          // fave/unfave, Pro) on this day
           const contributors = [];
           for (const p of visiblePeople) {
             const e = entryFor(p, d);
-            if (e && (e.type === "fave" || e.type === "unfave")) {
+            if (e && e.type !== "neutral") {
               contributors.push({ person: p, entry: e });
             }
           }
 
           const anyFave = contributors.some(c => c.entry.type === "fave");
           const anyUnfave = contributors.some(c => c.entry.type === "unfave");
+          const anySmallFave = contributors.some(c => c.entry.type === "small-fave");
+          const anySmallUnfave = contributors.some(c => c.entry.type === "small-unfave");
 
           // Tooltip — always include times when we know the transit boundary
           let tooltip = "";
@@ -748,13 +853,13 @@ function CalendarMonth({ year, month, people, peopleYearData, initials, onSelect
             }
           } else if (isSolo) {
             const c = contributors[0];
-            const label = c.entry.type === "fave" ? "Fave Day" : "Unfave Day";
+            const label = TYPE_LABELS[c.entry.type];
             tooltip = `${label} (${SIGNS[c.entry.moonSign]} Moon)`;
             if (c.entry.transitStartHour !== null) tooltip += `\nStarts ~${formatHour(c.entry.transitStartHour)}`;
             if (c.entry.transitEndHour !== null) tooltip += `\nEnds ~${formatHour(c.entry.transitEndHour)}`;
           } else {
             tooltip = contributors.map(c => {
-              const label = c.entry.type === "fave" ? "Fave Day" : "Unfave Day";
+              const label = TYPE_LABELS[c.entry.type];
               let line = `${c.person.name} — ${label} (${SIGNS[c.entry.moonSign]} Moon)`;
               if (c.entry.transitStartHour !== null) line += ` · starts ~${formatHour(c.entry.transitStartHour)}`;
               if (c.entry.transitEndHour !== null) line += ` · ends ~${formatHour(c.entry.transitEndHour)}`;
@@ -777,7 +882,9 @@ function CalendarMonth({ year, month, people, peopleYearData, initials, onSelect
             }
           }
 
-          // Soft cell tint — gold if fave-only, brown if unfave-only, purple if mixed
+          // Soft cell tint — gold if fave-only, brown if unfave-only, purple if
+          // mixed. Small (Moon-sign) days use lighter silver-blue / slate tints
+          // and only apply when no big (Sun-sign) day shares the cell.
           let cellBackground = "transparent";
           let cellBorder = "1px solid transparent";
           if (anyFave && !anyUnfave) {
@@ -789,11 +896,23 @@ function CalendarMonth({ year, month, people, peopleYearData, initials, onSelect
           } else if (anyFave && anyUnfave) {
             cellBackground = "radial-gradient(circle, rgba(139,92,246,0.22) 0%, rgba(139,92,246,0.06) 100%)";
             cellBorder = "1px solid rgba(139,92,246,0.35)";
+          } else if (anySmallFave && !anySmallUnfave) {
+            cellBackground = "radial-gradient(circle, rgba(103,232,249,0.20) 0%, rgba(103,232,249,0.05) 100%)";
+            cellBorder = "1px dashed rgba(103,232,249,0.4)";
+          } else if (anySmallUnfave && !anySmallFave) {
+            cellBackground = "radial-gradient(circle, rgba(148,163,184,0.20) 0%, rgba(148,163,184,0.05) 100%)";
+            cellBorder = "1px dashed rgba(148,163,184,0.4)";
+          } else if (anySmallFave && anySmallUnfave) {
+            cellBackground = "radial-gradient(circle, rgba(139,92,246,0.14) 0%, rgba(139,92,246,0.04) 100%)";
+            cellBorder = "1px dashed rgba(139,92,246,0.3)";
           }
 
           const cellTextColor = anyFave && !anyUnfave ? "#fef08a"
             : anyUnfave && !anyFave ? "#fdba74"
             : anyFave && anyUnfave ? "#e9d5ff"
+            : anySmallFave && !anySmallUnfave ? "#a5f3fc"
+            : anySmallUnfave && !anySmallFave ? "#cbd5e1"
+            : anySmallFave && anySmallUnfave ? "#e9d5ff"
             : "rgba(255,255,255,0.5)";
 
           const shown = contributors.slice(0, MAX_CHIPS);
@@ -835,7 +954,8 @@ function CalendarMonth({ year, month, people, peopleYearData, initials, onSelect
                   pointerEvents: "none"
                 }}>
                   {shown.map((c, idx) => {
-                    const isFaveChip = c.entry.type === "fave";
+                    const isFaveChip = c.entry.type === "fave" || c.entry.type === "small-fave";
+                    const isSmallChip = c.entry.type === "small-fave" || c.entry.type === "small-unfave";
                     const label = (initials && initials[c.person.id]) || (c.person.name.trim()[0] || "?").toUpperCase();
                     return (
                       <span key={idx} style={{
@@ -844,9 +964,10 @@ function CalendarMonth({ year, month, people, peopleYearData, initials, onSelect
                         borderRadius: 7, boxSizing: "border-box",
                         fontSize: 8, fontWeight: 800, lineHeight: 1, letterSpacing: 0,
                         background: isFaveChip ? c.person.color : "transparent",
-                        border: `1.5px solid ${c.person.color}`,
+                        border: `1.5px ${isSmallChip ? "dashed" : "solid"} ${c.person.color}`,
                         color: isFaveChip ? "#0a0015" : c.person.color,
-                        boxShadow: isFaveChip ? "0 0 0 0.5px rgba(0,0,0,0.35)" : "none"
+                        opacity: isSmallChip ? 0.6 : 1,
+                        boxShadow: isFaveChip && !isSmallChip ? "0 0 0 0.5px rgba(0,0,0,0.35)" : "none"
                       }}>
                         {label}
                       </span>
@@ -1237,11 +1358,20 @@ function DayDetailModal({ selected, onClose, isSolo }) {
         </h3>
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           {contributors.map((c, i) => {
-            const isFave = c.entry.type === "fave";
-            const label = isFave ? "Fave Day" : "Unfave Day";
-            const accent = isFave ? "#fef08a" : "#fdba74";
-            const bg = isFave ? "rgba(250,204,21,0.10)" : "rgba(180,83,9,0.18)";
-            const border = isFave ? "rgba(250,204,21,0.35)" : "rgba(180,83,9,0.45)";
+            const type = c.entry.type;
+            const label = TYPE_LABELS[type];
+            const accent = type === "fave" ? "#fef08a"
+              : type === "unfave" ? "#fdba74"
+              : type === "small-fave" ? "#a5f3fc"
+              : "#cbd5e1";
+            const bg = type === "fave" ? "rgba(250,204,21,0.10)"
+              : type === "unfave" ? "rgba(180,83,9,0.18)"
+              : type === "small-fave" ? "rgba(103,232,249,0.08)"
+              : "rgba(148,163,184,0.10)";
+            const border = type === "fave" ? "rgba(250,204,21,0.35)"
+              : type === "unfave" ? "rgba(180,83,9,0.45)"
+              : type === "small-fave" ? "rgba(103,232,249,0.3)"
+              : "rgba(148,163,184,0.3)";
             const hasStart = c.entry.transitStartHour !== null && c.entry.transitStartHour !== undefined;
             const hasEnd = c.entry.transitEndHour !== null && c.entry.transitEndHour !== undefined;
             return (
@@ -1303,6 +1433,7 @@ export default function FaveDayApp() {
   const [birthDay, setBirthDay] = useState("");
   const [birthYear, setBirthYear] = useState("");
   const [birthHour, setBirthHour] = useState("");
+  const [birthTz, setBirthTz] = useState(BROWSER_TZ);
   const [displayYear, setDisplayYear] = useState(new Date().getFullYear());
   const [displayStartMonth, setDisplayStartMonth] = useState(new Date().getMonth()); // 0-indexed
 
@@ -1314,9 +1445,18 @@ export default function FaveDayApp() {
   const [formDay, setFormDay] = useState("");
   const [formYear, setFormYear] = useState("");
   const [formHour, setFormHour] = useState("");
+  const [formTz, setFormTz] = useState(BROWSER_TZ);
   const [formError, setFormError] = useState("");
   const [perPersonOpen, setPerPersonOpen] = useState(false);
   const [selectedDay, setSelectedDay] = useState(null); // { year, month, day, contributors }
+
+  // Pro: Small Fave/Unfave days based on the natal Moon sign
+  const [proEnabled, setProEnabled] = useState(() => {
+    try { return localStorage.getItem(PRO_STORAGE_KEY) === "1"; } catch { return false; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(PRO_STORAGE_KEY, proEnabled ? "1" : "0"); } catch { /* ignore */ }
+  }, [proEnabled]);
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -1340,10 +1480,13 @@ export default function FaveDayApp() {
   const peopleYearData = useMemo(() => {
     const map = {};
     for (const p of people) {
-      map[p.id] = generateYearData(displayYear, p.sunSign, displayStartMonth);
+      map[p.id] = generateYearData(
+        displayYear, p.sunSign, displayStartMonth,
+        proEnabled ? p.natalMoonSign : null
+      );
     }
     return map;
-  }, [people, displayYear, displayStartMonth]);
+  }, [people, displayYear, displayStartMonth, proEnabled]);
 
   const calculate = useCallback(() => {
     setError("");
@@ -1361,7 +1504,7 @@ export default function FaveDayApp() {
       try {
         const hr = birthHour === "" ? null : parseInt(birthHour);
         const primary = createPerson({
-          name: "Me", month: m, day: d, year: y, hour: hr, colorIndex: 0,
+          name: "Me", month: m, day: d, year: y, hour: hr, tz: birthTz, colorIndex: 0,
         });
         setPeople([primary]);
         const now = new Date();
@@ -1373,7 +1516,7 @@ export default function FaveDayApp() {
       }
       setLoading(false);
     }, 100);
-  }, [birthYear, birthMonth, birthDay, birthHour]);
+  }, [birthYear, birthMonth, birthDay, birthHour, birthTz]);
 
   const switchRange = useCallback((direction) => {
     if (people.length === 0) return;
@@ -1386,6 +1529,7 @@ export default function FaveDayApp() {
     setEditingPersonId("new");
     setFormName("");
     setFormMonth(""); setFormDay(""); setFormYear(""); setFormHour("");
+    setFormTz(BROWSER_TZ);
     setFormError("");
   }, [people.length]);
 
@@ -1396,6 +1540,7 @@ export default function FaveDayApp() {
     setFormDay(String(person.day));
     setFormYear(String(person.year));
     setFormHour(person.hour === null ? "" : String(person.hour));
+    setFormTz(person.tz || BROWSER_TZ);
     setFormError("");
   }, []);
 
@@ -1419,22 +1564,24 @@ export default function FaveDayApp() {
     if (editingPersonId === "new") {
       if (people.length >= MAX_PEOPLE) { setFormError(`Maximum ${MAX_PEOPLE} people.`); return; }
       const next = createPerson({
-        name, month: m, day: d, year: y, hour: hr, colorIndex: people.length,
+        name, month: m, day: d, year: y, hour: hr, tz: formTz, colorIndex: people.length,
       });
       setPeople([...people, next]);
     } else {
       setPeople(people.map(p => {
         if (p.id !== editingPersonId) return p;
         const h = hr === null ? 12 : hr;
+        const zone = formTz || BROWSER_TZ;
         return {
           ...p,
-          name, month: m, day: d, year: y, hour: hr,
-          sunSign: getSiderealSunSign(y, m, d, h),
+          name, month: m, day: d, year: y, hour: hr, tz: zone,
+          sunSign: getNatalSunSign(y, m, d, h, zone),
+          natalMoonSign: getNatalMoonSign(y, m, d, h, zone),
         };
       }));
     }
     setEditingPersonId(null);
-  }, [editingPersonId, formName, formMonth, formDay, formYear, formHour, people]);
+  }, [editingPersonId, formName, formMonth, formDay, formYear, formHour, formTz, people]);
 
   const deletePerson = useCallback((id) => {
     setPeople(prev => prev.filter(p => p.id !== id));
@@ -1592,6 +1739,37 @@ export default function FaveDayApp() {
               </div>
             </div>
 
+            {/* Birth time zone */}
+            <div style={{ marginBottom: 16 }}>
+              <label style={{ fontSize: 11, color: "rgba(196,181,253,0.5)", display: "block", marginBottom: 4, letterSpacing: 1, textTransform: "uppercase" }}>
+                Where were you born? <span style={{ opacity: 0.6, textTransform: "none" }}>(time zone — we handle the UTC math for you)</span>
+              </label>
+              <select
+                value={birthTz}
+                onChange={e => setBirthTz(e.target.value)}
+                style={{
+                  width: "100%", padding: "12px 14px", borderRadius: 10,
+                  background: "rgba(255,255,255,0.06)",
+                  border: "1px solid rgba(139,92,246,0.2)",
+                  color: "#fff", fontSize: 14, fontWeight: 600,
+                  appearance: "none", WebkitAppearance: "none",
+                  backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23c4b5fd' d='M6 8L1 3h10z'/%3E%3C/svg%3E")`,
+                  backgroundRepeat: "no-repeat",
+                  backgroundPosition: "right 12px center"
+                }}
+              >
+                {TIME_ZONES.map(z => (
+                  <option key={z} value={z} style={{ background: "#1a0a2e", color: "#fff" }}>
+                    {z.replace(/_/g, " ")}
+                  </option>
+                ))}
+              </select>
+              <div style={{ fontSize: 11, color: "rgba(196,181,253,0.35)", marginTop: 4, lineHeight: 1.4 }}>
+                Pick the city or region closest to your birthplace. Defaults to where you are now,
+                which is right for most people. DST and historical offsets are handled automatically.
+              </div>
+            </div>
+
             {/* Calendar starts automatically from the current month */}
 
             {error && (
@@ -1691,7 +1869,14 @@ export default function FaveDayApp() {
     const primary = people[0];
     const primarySign = primary.sunSign;
     const primaryOpp = OPPOSITE_SIGN[primarySign];
+    const primaryMoon = primary.natalMoonSign;
+    const primaryMoonOpp = primaryMoon !== null && primaryMoon !== undefined ? OPPOSITE_SIGN[primaryMoon] : null;
     const visibleCount = people.filter(p => p.visible).length;
+    // People whose Moon sign is a guess: no birth time entered, and the Moon
+    // changed signs at some point on their birthday.
+    const uncertainMoonPeople = proEnabled
+      ? people.filter(p => p.hour === null && isMoonBoundaryBirthday(p.year, p.month, p.day, p.tz))
+      : [];
     const isEditingForm = editingPersonId !== null;
 
     const formInputStyle = {
@@ -1733,6 +1918,25 @@ export default function FaveDayApp() {
                 const h12 = i === 0 ? 12 : i > 12 ? i - 12 : i;
                 return <option key={i} value={i} style={{ background: "#1a0a2e", color: "#fff" }}>{h12}:00 {ampm}</option>;
               })}
+            </select>
+          </div>
+          <div style={{ marginBottom: 10 }}>
+            <label style={{ fontSize: 10, color: "rgba(196,181,253,0.5)", display: "block", marginBottom: 4, letterSpacing: 0.5, textTransform: "uppercase" }}>
+              Birth time zone <span style={{ opacity: 0.6, textTransform: "none" }}>(where they were born)</span>
+            </label>
+            <select value={formTz} onChange={e => setFormTz(e.target.value)}
+              style={{
+                ...formInputStyle,
+                appearance: "none", WebkitAppearance: "none",
+                backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 12 12'%3E%3Cpath fill='%23c4b5fd' d='M6 8L1 3h10z'/%3E%3C/svg%3E")`,
+                backgroundRepeat: "no-repeat",
+                backgroundPosition: "right 10px center"
+              }}>
+              {TIME_ZONES.map(z => (
+                <option key={z} value={z} style={{ background: "#1a0a2e", color: "#fff" }}>
+                  {z.replace(/_/g, " ")}
+                </option>
+              ))}
             </select>
           </div>
           {formError && (
@@ -1817,6 +2021,66 @@ export default function FaveDayApp() {
               <span>Fave Day = <span style={{ color: "#fef08a", fontWeight: 700 }}>{SIGN_SYMBOLS[primarySign]} {SIGNS[primarySign]}</span> Moon</span>
               <span>Unfave Day = <span style={{ color: "#fdba74", fontWeight: 700 }}>{SIGN_SYMBOLS[primaryOpp]} {SIGNS[primaryOpp]}</span> Moon</span>
             </div>
+            {proEnabled && primaryMoon !== null && primaryMoon !== undefined && (
+              <div style={{
+                display: "inline-flex", flexWrap: "wrap", justifyContent: "center",
+                gap: 20, marginTop: 10, fontSize: 13, color: "rgba(255,255,255,0.5)"
+              }}>
+                <span>Small Fave = <span style={{ color: "#a5f3fc", fontWeight: 700 }}>{SIGN_SYMBOLS[primaryMoon]} {SIGNS[primaryMoon]}</span> Moon <span style={{ opacity: 0.6 }}>(your Moon sign)</span></span>
+                <span>Small Unfave = <span style={{ color: "#cbd5e1", fontWeight: 700 }}>{SIGN_SYMBOLS[primaryMoonOpp]} {SIGNS[primaryMoonOpp]}</span> Moon</span>
+              </div>
+            )}
+          </div>
+
+          {/* PRO: Small Fave/Unfave days */}
+          <div style={{
+            background: proEnabled ? "rgba(103,232,249,0.06)" : "rgba(15,10,40,0.7)",
+            border: `1px solid ${proEnabled ? "rgba(103,232,249,0.35)" : "rgba(139,92,246,0.25)"}`,
+            borderRadius: 16, padding: "20px 24px", marginBottom: 20,
+            backdropFilter: "blur(10px)",
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+              <div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{
+                    fontSize: 10, fontWeight: 800, letterSpacing: 1.5,
+                    color: "#0a0015", background: "linear-gradient(135deg, #67e8f9, #a5f3fc)",
+                    borderRadius: 5, padding: "2px 7px"
+                  }}>PRO</span>
+                  <span style={{ color: "#a5f3fc", fontSize: 15, fontWeight: 700 }}>
+                    Small Fave & Unfave Days
+                  </span>
+                </div>
+                <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 12, marginTop: 4, maxWidth: 520 }}>
+                  A gentler, secondary cycle based on your sidereal <strong style={{ color: "rgba(165,243,252,0.8)" }}>Moon sign</strong> —
+                  Small Fave when the Moon revisits your natal Moon sign, Small Unfave when it's in the opposite sign.
+                </div>
+              </div>
+              <button onClick={() => setProEnabled(v => !v)}
+                style={{
+                  ...btnBase, padding: "10px 20px", fontSize: 13,
+                  background: proEnabled
+                    ? "rgba(103,232,249,0.15)"
+                    : "linear-gradient(135deg, #0891b2, #06b6d4)",
+                  border: proEnabled ? "1px solid rgba(103,232,249,0.5)" : "none",
+                  color: proEnabled ? "#a5f3fc" : "#fff",
+                }}>
+                {proEnabled ? "Enabled ✓" : "Enable"}
+              </button>
+            </div>
+            {uncertainMoonPeople.length > 0 && (
+              <div style={{
+                marginTop: 12, padding: "10px 14px", borderRadius: 10,
+                background: "rgba(250,204,21,0.08)",
+                border: "1px solid rgba(250,204,21,0.3)",
+                fontSize: 12, color: "rgba(254,240,138,0.85)", lineHeight: 1.5
+              }}>
+                ⚠️ The Moon changed signs on {uncertainMoonPeople.map(p => p.name).join(", ")}
+                {uncertainMoonPeople.length === 1 ? "'s birthday" : "'s birthdays"} — without a birth
+                time, the Moon sign (and Small Fave/Unfave days) is a best guess. Click{" "}
+                <strong style={{ color: "#fef08a" }}>Edit</strong> next to the name below to add a birth time.
+              </div>
+            )}
           </div>
 
           {/* People card */}
@@ -1884,6 +2148,23 @@ export default function FaveDayApp() {
                       <span style={{ color: "rgba(255,255,255,0.6)", fontSize: 13 }}>
                         {SIGN_SYMBOLS[p.sunSign]} {SIGNS[p.sunSign]}
                       </span>
+                      {proEnabled && p.natalMoonSign !== null && p.natalMoonSign !== undefined && (
+                        <span style={{ color: "rgba(165,243,252,0.7)", fontSize: 13 }}
+                          title="Sidereal Moon sign (Pro)">
+                          ☾ {SIGNS[p.natalMoonSign]}
+                        </span>
+                      )}
+                      {uncertainMoonPeople.some(u => u.id === p.id) && (
+                        <span style={{
+                          fontSize: 10, fontWeight: 700, color: "#fef08a",
+                          background: "rgba(250,204,21,0.1)",
+                          border: "1px solid rgba(250,204,21,0.35)",
+                          borderRadius: 6, padding: "2px 6px", whiteSpace: "nowrap"
+                        }}
+                          title="The Moon changed signs on this birthday. Add a birth time (Edit) for an exact Moon sign.">
+                          ⚠ Moon sign uncertain
+                        </span>
+                      )}
                       <span style={{ color: "rgba(255,255,255,0.3)", fontSize: 12, marginLeft: "auto" }}>
                         {String(p.month).padStart(2, "0")}/{String(p.day).padStart(2, "0")}/{p.year}
                         {p.hour !== null && <span> · {formatHour(p.hour)}</span>}
@@ -1951,8 +2232,8 @@ export default function FaveDayApp() {
                 <div style={{ color: "#c4b5fd", fontSize: 15, fontWeight: 700 }}>Add to Calendar</div>
                 <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 12, marginTop: 2 }}>
                   {people.length > 1
-                    ? `Fave + Unfave days for ${visibleCount} visible ${visibleCount === 1 ? "person" : "people"}`
-                    : "Fave + Unfave days — works with Apple Calendar, Google, and Outlook"}
+                    ? `Fave + Unfave${proEnabled ? " + Small" : ""} days for ${visibleCount} visible ${visibleCount === 1 ? "person" : "people"}`
+                    : `Fave + Unfave${proEnabled ? " + Small" : ""} days — works with Apple Calendar, Google, and Outlook`}
                 </div>
               </div>
               <button onClick={() => downloadCombinedICS(people, peopleYearData, "all")}
@@ -1967,6 +2248,40 @@ export default function FaveDayApp() {
                 Download .ics
               </button>
             </div>
+
+            {proEnabled && (
+              <div style={{
+                marginTop: 12, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap"
+              }}>
+                <span style={{ fontSize: 12, color: "rgba(255,255,255,0.35)" }}>
+                  Or download separately:
+                </span>
+                <button onClick={() => downloadCombinedICS(people, peopleYearData, "big")}
+                  disabled={visibleCount === 0}
+                  style={{
+                    ...btnBase, padding: "7px 14px", fontSize: 12,
+                    background: "rgba(250,204,21,0.1)",
+                    border: "1px solid rgba(250,204,21,0.35)",
+                    color: "#fef08a",
+                    opacity: visibleCount === 0 ? 0.4 : 1,
+                    cursor: visibleCount === 0 ? "not-allowed" : "pointer"
+                  }}>
+                  Fave & Unfave only
+                </button>
+                <button onClick={() => downloadCombinedICS(people, peopleYearData, "small")}
+                  disabled={visibleCount === 0}
+                  style={{
+                    ...btnBase, padding: "7px 14px", fontSize: 12,
+                    background: "rgba(103,232,249,0.1)",
+                    border: "1px dashed rgba(103,232,249,0.45)",
+                    color: "#a5f3fc",
+                    opacity: visibleCount === 0 ? 0.4 : 1,
+                    cursor: visibleCount === 0 ? "not-allowed" : "pointer"
+                  }}>
+                  Small days only
+                </button>
+              </div>
+            )}
 
             {people.length > 1 && (
               <div style={{ marginTop: 14, borderTop: "1px solid rgba(139,92,246,0.2)", paddingTop: 12 }}>
@@ -2007,6 +2322,18 @@ export default function FaveDayApp() {
                           }}>
                           Download .ics
                         </button>
+                        {proEnabled && (
+                          <button onClick={() => downloadPersonICS(p, peopleYearData[p.id] || [], "small")}
+                            title="Small Fave & Unfave days only"
+                            style={{
+                              ...btnBase, padding: "6px 14px", fontSize: 12,
+                              background: "rgba(103,232,249,0.1)",
+                              border: "1px dashed rgba(103,232,249,0.4)",
+                              color: "#a5f3fc"
+                            }}>
+                            Small only
+                          </button>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -2059,6 +2386,18 @@ export default function FaveDayApp() {
               <span style={{ width: 14, height: 14, borderRadius: 4, background: "rgba(239,68,68,0.3)", border: "1px solid rgba(239,68,68,0.3)", display: "inline-block" }} />
               {people.length > 1 ? `${primary.name}'s Unfave Day` : "Unfave Day"}
             </span>
+            {proEnabled && (
+              <>
+                <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ width: 14, height: 14, borderRadius: 4, background: "rgba(103,232,249,0.18)", border: "1px dashed rgba(103,232,249,0.5)", display: "inline-block" }} />
+                  Small Fave Day
+                </span>
+                <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ width: 14, height: 14, borderRadius: 4, background: "rgba(148,163,184,0.18)", border: "1px dashed rgba(148,163,184,0.5)", display: "inline-block" }} />
+                  Small Unfave Day
+                </span>
+              </>
+            )}
             {people.length > 1 && (
               <>
                 <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
